@@ -192,6 +192,12 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         threads will be used. In particular, ``n_jobs=-1`` means that all logical cores
         will be used.
 
+    differentiable_input : bool, default=False
+        Whether to enable end-to-end differentiable input support. When True,
+        use ``fit_with_differentiable_input`` and ``predict_differentiable`` instead
+        of the standard ``fit``/``predict`` methods to maintain gradient flow through
+        the model. This is useful for prompt tuning and explainability.
+
     verbose : bool, default=False
         Whether to print detailed information during inference.
 
@@ -294,6 +300,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         disk_offload_dir: Optional[str] = None,
         random_state: int | None = 42,
         n_jobs: Optional[int] = None,
+        differentiable_input: bool = False,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
     ):
@@ -317,6 +324,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         self.disk_offload_dir = disk_offload_dir
         self.n_jobs = n_jobs
         self.random_state = random_state
+        self.differentiable_input = differentiable_input
         self.verbose = verbose
         self.inference_config = inference_config
 
@@ -553,6 +561,153 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
 
             # Merge all batch caches into a single cache
             self.model_kv_cache_[norm_method] = TabICLCache.concat(caches)
+
+    def fit_with_differentiable_input(self, X: torch.Tensor, y: torch.Tensor) -> TabICLClassifier:
+        """Fit the classifier with differentiable tensor inputs.
+
+        Unlike ``fit``, this method accepts raw ``torch.Tensor`` inputs and bypasses
+        all non-differentiable sklearn preprocessing (label encoding, feature
+        encoding, ensemble generation). The model is put in train mode so that
+        ``forward`` dispatches to ``_train_forward``, which is fully differentiable.
+
+        On the **first call**, the model is loaded, moved to device, put in train
+        mode with frozen weights, and z-norm statistics are computed from X. On
+        subsequent calls only the stored training data references are updated.
+
+        Parameters
+        ----------
+        X : torch.Tensor of shape (n_samples, n_features)
+            Training input data. Must be a float tensor.
+
+        y : torch.Tensor of shape (n_samples,)
+            Training target labels as integer class indices in ``[0, n_classes - 1]``.
+
+        Returns
+        -------
+        self : TabICLClassifier
+            Fitted classifier instance.
+
+        Raises
+        ------
+        TypeError
+            If X or y are not ``torch.Tensor``.
+
+        ValueError
+            If the number of classes exceeds the model's ``max_classes`` (hierarchical
+            classification is not supported in differentiable mode).
+        """
+        if not isinstance(X, torch.Tensor):
+            raise TypeError(
+                f"X must be a torch.Tensor for differentiable input, got {type(X).__name__}"
+            )
+        if not isinstance(y, torch.Tensor):
+            raise TypeError(
+                f"y must be a torch.Tensor for differentiable input, got {type(y).__name__}"
+            )
+
+        is_first_fit_call = not hasattr(self, "diff_mean_")
+
+        if is_first_fit_call:
+            # Set up device
+            if self.device is None:
+                self.device_ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            elif isinstance(self.device, str):
+                self.device_ = torch.device(self.device)
+            else:
+                self.device_ = self.device
+
+            # Load model and move to device
+            self._load_model()
+            self.model_.to(self.device_)
+
+            # Put model in train mode for differentiable _train_forward path
+            self.model_.train()
+
+            # Freeze model weights — only input should receive gradients
+            for param in self.model_.parameters():
+                param.requires_grad = False
+
+            # Compute z-norm statistics (detached, computed once)
+            self.diff_mean_ = X.detach().mean(dim=0)
+            self.diff_std_ = X.detach().std(dim=0).clamp(min=1e-8)
+
+            # Store class metadata
+            n_classes = int(y.max().item()) + 1
+            self.n_classes_ = n_classes
+            self.classes_ = torch.arange(n_classes)
+
+            if n_classes > self.model_.max_classes:
+                raise ValueError(
+                    f"The number of classes ({n_classes}) exceeds the max number of classes "
+                    f"({self.model_.max_classes}) natively supported by the model. "
+                    f"Hierarchical classification is not supported in differentiable mode."
+                )
+
+        # Store training data references (updated on every call)
+        self.X_train_ = X
+        self.y_train_ = y
+
+        return self
+
+    def predict_differentiable(
+        self,
+        X_test: torch.Tensor,
+        return_logits: bool = True,
+        softmax_temperature: float = 0.9,
+    ) -> torch.Tensor:
+        """Predict with full gradient flow from inputs to outputs.
+
+        This method bypasses all non-differentiable preprocessing and calls the
+        model directly, preserving the computation graph for backpropagation.
+
+        Parameters
+        ----------
+        X_test : torch.Tensor of shape (n_test, n_features)
+            Test input data. Must be a float tensor.
+
+        return_logits : bool, default=True
+            If True, return raw logits. If False, return softmax probabilities.
+
+        softmax_temperature : float, default=0.9
+            Temperature for softmax when ``return_logits=False``.
+
+        Returns
+        -------
+        torch.Tensor of shape (n_test, n_classes)
+            Predicted logits or probabilities for each test sample.
+
+        Raises
+        ------
+        RuntimeError
+            If ``fit_with_differentiable_input`` has not been called first.
+        """
+        if not hasattr(self, "diff_mean_"):
+            raise RuntimeError(
+                "fit_with_differentiable_input must be called before predict_differentiable"
+            )
+
+        # Differentiable z-norm for both train and test
+        X_train_normed = (self.X_train_ - self.diff_mean_) / self.diff_std_
+        X_test_normed = (X_test - self.diff_mean_) / self.diff_std_
+
+        # Concatenate train + test: shape (T, H)
+        X_combined = torch.cat([X_train_normed, X_test_normed], dim=0)
+
+        # Add batch dimension: shape (1, T, H)
+        X_combined = X_combined.unsqueeze(0).to(self.device_)
+        y_train = self.y_train_.unsqueeze(0).float().to(self.device_)
+
+        # Forward pass — model is in train mode, uses _train_forward
+        # Output shape: (1, n_test, max_classes) — ICLearning.forward slices to test-only
+        out = self.model_(X_combined, y_train)
+
+        # Slice to actual number of classes: (n_test, n_classes)
+        logits = out[0, :, :self.n_classes_]
+
+        if not return_logits:
+            return torch.softmax(logits / softmax_temperature, dim=-1)
+
+        return logits
 
     def _batch_forward(
         self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
