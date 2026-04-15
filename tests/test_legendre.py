@@ -3,7 +3,8 @@
 import torch
 import pytest
 
-from tabicl.model.legendre import legendre_basis, LegendreLinear, LegendreEncoder
+from tabicl.model.legendre import legendre_basis, LegendreLinear, LegendreEncoder, LegendreAttentionBlock
+from tabicl.model.layers import MultiheadAttentionBlock
 from tabicl.model.encoders import Encoder
 from tabicl.model.kv_cache import KVCache
 
@@ -152,6 +153,38 @@ class TestLegendreEncoder:
         params_split = sum(p.numel() for p in enc.parameters())
         params_uniform = sum(p.numel() for p in enc_uniform.parameters())
         assert params_split < params_uniform
+
+    def test_sandwich_structure(self, encoder_kwargs):
+        """Sandwich: first/last blocks are standard, middle are Legendre."""
+        enc = LegendreEncoder(num_coeffs=4, sandwich=True, **encoder_kwargs)
+        assert enc.sandwich is True
+        assert isinstance(enc.blocks[0], MultiheadAttentionBlock)
+        assert isinstance(enc.blocks[-1], MultiheadAttentionBlock)
+        for block in enc.blocks[1:-1]:
+            assert isinstance(block, LegendreAttentionBlock)
+
+        # Legendre generators cover only middle blocks (num_blocks - 2)
+        assert enc.attn_in_proj.num_layers == encoder_kwargs["num_blocks"] - 2
+
+        x = torch.randn(2, 10, 64)
+        out = enc(x)
+        assert out.shape == (2, 10, 64)
+
+    def test_sandwich_disabled(self, encoder_kwargs):
+        """sandwich=False means all blocks are Legendre."""
+        enc = LegendreEncoder(num_coeffs=4, sandwich=False, **encoder_kwargs)
+        assert enc.sandwich is False
+        for block in enc.blocks:
+            assert isinstance(block, LegendreAttentionBlock)
+        assert enc.attn_in_proj.num_layers == encoder_kwargs["num_blocks"]
+
+    def test_sandwich_auto_disabled_small(self):
+        """Sandwich auto-disables when num_blocks < 3."""
+        enc = LegendreEncoder(
+            num_blocks=2, num_coeffs=2, d_model=64, nhead=4,
+            dim_feedforward=128, sandwich=True,
+        )
+        assert enc.sandwich is False  # auto-disabled
 
     def test_forward_with_rope(self, encoder_kwargs):
         enc = LegendreEncoder(num_coeffs=4, use_rope=True, **encoder_kwargs)

@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .attention import multi_head_attention_forward
+from .layers import MultiheadAttentionBlock
 from .rope import RotaryEmbedding
 from .ssmax import create_ssmax_layer
 from .kv_cache import KVCacheEntry, KVCache
@@ -433,6 +434,12 @@ class LegendreEncoder(nn.Module):
         same as ``num_coeffs`` (the attention value). FFN weights are often
         more compressible than attention weights, so fewer coefficients may
         suffice (e.g., num_coeffs=6 for attention, num_coeffs_ffn=3 for FFN).
+    sandwich : bool
+        If True (default), the first and last blocks are independent standard
+        ``MultiheadAttentionBlock`` with their own weights, and only the
+        middle blocks use Legendre parameterization. This follows the
+        empirical observation that boundary layers behave differently.
+        Requires ``num_blocks >= 3``. If False, all blocks use Legendre.
     """
 
     def __init__(
@@ -452,11 +459,15 @@ class LegendreEncoder(nn.Module):
         ssmax: Union[bool, str] = False,
         recompute: bool = False,
         num_coeffs_ffn: Optional[int] = None,
+        sandwich: bool = True,
     ):
         super().__init__()
 
         if d_model % nhead != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
+
+        if sandwich and num_blocks < 3:
+            sandwich = False  # Not enough blocks for sandwich structure
 
         if num_coeffs_ffn is None:
             num_coeffs_ffn = num_coeffs
@@ -468,32 +479,31 @@ class LegendreEncoder(nn.Module):
         self.nhead = nhead
         self.dim_feedforward = dim_feedforward
         self.recompute = recompute
+        self.sandwich = sandwich
 
-        # Legendre-parameterized weight groups
-        # Attention weights: higher degree for more expressivity
-        self.attn_in_proj = LegendreLinear(num_blocks, num_coeffs, 3 * d_model, d_model, bias=True)
-        self.attn_out_proj = LegendreLinear(num_blocks, num_coeffs, d_model, d_model, bias=True)
+        # Number of Legendre-parameterized middle blocks
+        num_middle = num_blocks - 2 if sandwich else num_blocks
 
-        # FFN weights: potentially fewer coefficients (more compressible)
-        self.ff1 = LegendreLinear(num_blocks, num_coeffs_ffn, dim_feedforward, d_model, bias=True)
-        self.ff2 = LegendreLinear(num_blocks, num_coeffs_ffn, d_model, dim_feedforward, bias=True)
+        # Legendre-parameterized weight groups (for middle blocks only)
+        self.attn_in_proj = LegendreLinear(num_middle, num_coeffs, 3 * d_model, d_model, bias=True)
+        self.attn_out_proj = LegendreLinear(num_middle, num_coeffs, d_model, d_model, bias=True)
+        self.ff1 = LegendreLinear(num_middle, num_coeffs_ffn, dim_feedforward, d_model, bias=True)
+        self.ff2 = LegendreLinear(num_middle, num_coeffs_ffn, d_model, dim_feedforward, bias=True)
 
-        # Per-layer shells (hold LayerNorm, dropout, SSMax)
-        self.blocks = nn.ModuleList(
-            [
-                LegendreAttentionBlock(
-                    d_model=d_model,
-                    nhead=nhead,
-                    dim_feedforward=dim_feedforward,
-                    dropout=dropout,
-                    activation=activation,
-                    norm_first=norm_first,
-                    bias_free_ln=bias_free_ln,
-                    ssmax=ssmax,
-                )
-                for _ in range(num_blocks)
-            ]
+        block_kwargs = dict(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, activation=activation, norm_first=norm_first,
+            bias_free_ln=bias_free_ln, ssmax=ssmax,
         )
+
+        # Build block list: [independent?, legendre..., independent?]
+        blocks = []
+        for i in range(num_blocks):
+            if sandwich and (i == 0 or i == num_blocks - 1):
+                blocks.append(MultiheadAttentionBlock(**block_kwargs))
+            else:
+                blocks.append(LegendreAttentionBlock(**block_kwargs))
+        self.blocks = nn.ModuleList(blocks)
 
         self.rope = (
             RotaryEmbedding(dim=d_model // nhead, theta=rope_base, interleaved=rope_interleaved)
@@ -501,38 +511,48 @@ class LegendreEncoder(nn.Module):
             else None
         )
 
+    def _is_independent(self, block_idx: int) -> bool:
+        """Check if a block is an independent (non-Legendre) block."""
+        return self.sandwich and (block_idx == 0 or block_idx == self.num_blocks - 1)
+
+    def _legendre_idx(self, block_idx: int) -> int:
+        """Map outer block index to Legendre weight generator index."""
+        return block_idx - 1 if self.sandwich else block_idx
+
     def _get_block_weights(self, block_idx: int, weights=None) -> dict:
-        """Build weight kwargs for a single block.
+        """Build weight kwargs for a Legendre block.
 
         Parameters
         ----------
         block_idx : int
-            Index of the block.
+            Outer block index (0..num_blocks-1).
         weights : tuple of Tensor, optional
-            Pre-reconstructed (attn_in, attn_out, ff1, ff2) weight tensors.
+            Pre-reconstructed (attn_in, attn_out, ff1, ff2) weight tensors
+            indexed by Legendre index (0..num_middle-1).
             If None, reconstructs for this single block via get_weight().
         """
+        li = self._legendre_idx(block_idx)
         if weights is not None:
             attn_in_weights, attn_out_weights, ff1_weights, ff2_weights = weights
             return dict(
-                in_proj_weight=attn_in_weights[block_idx],
-                in_proj_bias=self.attn_in_proj.get_bias(block_idx),
-                out_proj_weight=attn_out_weights[block_idx],
-                out_proj_bias=self.attn_out_proj.get_bias(block_idx),
-                ff1_weight=ff1_weights[block_idx],
-                ff1_bias=self.ff1.get_bias(block_idx),
-                ff2_weight=ff2_weights[block_idx],
-                ff2_bias=self.ff2.get_bias(block_idx),
+                in_proj_weight=attn_in_weights[li],
+                in_proj_bias=self.attn_in_proj.get_bias(li),
+                out_proj_weight=attn_out_weights[li],
+                out_proj_bias=self.attn_out_proj.get_bias(li),
+                ff1_weight=ff1_weights[li],
+                ff1_bias=self.ff1.get_bias(li),
+                ff2_weight=ff2_weights[li],
+                ff2_bias=self.ff2.get_bias(li),
             )
         return dict(
-            in_proj_weight=self.attn_in_proj.get_weight(block_idx),
-            in_proj_bias=self.attn_in_proj.get_bias(block_idx),
-            out_proj_weight=self.attn_out_proj.get_weight(block_idx),
-            out_proj_bias=self.attn_out_proj.get_bias(block_idx),
-            ff1_weight=self.ff1.get_weight(block_idx),
-            ff1_bias=self.ff1.get_bias(block_idx),
-            ff2_weight=self.ff2.get_weight(block_idx),
-            ff2_bias=self.ff2.get_bias(block_idx),
+            in_proj_weight=self.attn_in_proj.get_weight(li),
+            in_proj_bias=self.attn_in_proj.get_bias(li),
+            out_proj_weight=self.attn_out_proj.get_weight(li),
+            out_proj_bias=self.attn_out_proj.get_bias(li),
+            ff1_weight=self.ff1.get_weight(li),
+            ff1_bias=self.ff1.get_bias(li),
+            ff2_weight=self.ff2.get_weight(li),
+            ff2_bias=self.ff2.get_bias(li),
         )
 
     def _reconstruct_all(self):
@@ -545,14 +565,19 @@ class LegendreEncoder(nn.Module):
         )
 
     def call_block(self, block_idx: int, *args, **kwargs):
-        """Call a single block by index with reconstructed weights.
+        """Call a single block by index.
 
-        Translates the standard MultiheadAttentionBlock call interface
-        (q, k, v, key_padding_mask, rope, etc.) to LegendreAttentionBlock's
-        interface which requires explicit weight arguments.
+        For independent (sandwich) blocks, forwards args directly to the
+        standard MultiheadAttentionBlock. For Legendre blocks, reconstructs
+        weights and passes them as kwargs.
 
         Used by RowInteraction._aggregate_embeddings.
         """
+        if self._is_independent(block_idx):
+            # Standard block — forward args/kwargs directly
+            return self.blocks[block_idx](*args, **kwargs)
+
+        # Legendre block — reconstruct weights and translate kwargs
         weight_kwargs = self._get_block_weights(block_idx)
 
         # Handle positional arg (checkpoint passes q as positional)
@@ -586,13 +611,20 @@ class LegendreEncoder(nn.Module):
 
         out = src
         for i, block in enumerate(self.blocks):
-            block_kwargs = self._get_block_weights(i, weights)
-            block_kwargs.update(q=out, train_size=train_size, rope=self.rope)
-            if self.recompute:
-                out = checkpoint(partial(block, **{k: v for k, v in block_kwargs.items() if k != "q"}),
-                                 block_kwargs["q"], use_reentrant=False)
+            if self._is_independent(i):
+                if self.recompute:
+                    out = checkpoint(partial(block, train_size=train_size, rope=self.rope),
+                                     out, use_reentrant=False)
+                else:
+                    out = block(q=out, train_size=train_size, rope=self.rope)
             else:
-                out = block(**block_kwargs)
+                block_kwargs = self._get_block_weights(i, weights)
+                block_kwargs.update(q=out, train_size=train_size, rope=self.rope)
+                if self.recompute:
+                    out = checkpoint(partial(block, **{k: v for k, v in block_kwargs.items() if k != "q"}),
+                                     block_kwargs["q"], use_reentrant=False)
+                else:
+                    out = block(**block_kwargs)
 
         return out
 
@@ -634,15 +666,22 @@ class LegendreEncoder(nn.Module):
 
         out = src
         for i, block in enumerate(self.blocks):
-            block_kwargs = self._get_block_weights(i, weights)
-            block_kwargs["rope"] = self.rope
-            if use_cache:
-                block_kwargs.update(q=out, cached_kv=icl_cache.kv[i])
-                out = block(**block_kwargs)
+            if self._is_independent(i):
+                if use_cache:
+                    out = block(q=out, rope=self.rope, cached_kv=icl_cache.kv[i])
+                else:
+                    out, k_proj, v_proj = block(q=out, train_size=train_size, rope=self.rope, need_kv=True)
+                    icl_cache.kv[i] = KVCacheEntry(key=k_proj, value=v_proj)
             else:
-                block_kwargs.update(q=out, train_size=train_size, need_kv=True)
-                out, k_proj, v_proj = block(**block_kwargs)
-                icl_cache.kv[i] = KVCacheEntry(key=k_proj, value=v_proj)
+                block_kwargs = self._get_block_weights(i, weights)
+                block_kwargs["rope"] = self.rope
+                if use_cache:
+                    block_kwargs.update(q=out, cached_kv=icl_cache.kv[i])
+                    out = block(**block_kwargs)
+                else:
+                    block_kwargs.update(q=out, train_size=train_size, need_kv=True)
+                    out, k_proj, v_proj = block(**block_kwargs)
+                    icl_cache.kv[i] = KVCacheEntry(key=k_proj, value=v_proj)
 
         return out
 
@@ -727,56 +766,61 @@ class LegendreEncoder(nn.Module):
         if use_rope and encoder.rope is not None:
             leg_encoder.rope.load_state_dict(encoder.rope.state_dict())
 
-        # Collect per-layer weights from the pretrained encoder
+        # Identify which source blocks are middle (Legendre) blocks
+        middle_blocks = []
+        for i, blk in enumerate(encoder.blocks):
+            if not leg_encoder._is_independent(i):
+                middle_blocks.append(blk)
+
+        # Collect per-layer weights from the middle blocks
         device = block0.attn.in_proj_weight.device
+        num_middle = len(middle_blocks)
 
         # Precompute pseudo-inverses for each coefficient count
         _pinv_cache = {}
         def _get_pinv(nc):
             if nc not in _pinv_cache:
-                basis = legendre_basis(num_blocks, nc, device=device).float()
+                basis = legendre_basis(num_middle, nc, device=device).float()
                 _pinv_cache[nc] = torch.linalg.pinv(basis)
             return _pinv_cache[nc]
 
         # Stack weights along layer dimension and project
         def _stack_and_project(get_param_fn, leg_linear: LegendreLinear):
-            """Stack per-layer params and fit Legendre coefficients via least-squares."""
-            weights = torch.stack([get_param_fn(blk) for blk in encoder.blocks], dim=0)  # (L, O, I)
+            """Stack middle-block params and fit Legendre coefficients via least-squares."""
+            weights = torch.stack([get_param_fn(blk) for blk in middle_blocks], dim=0)
             pinv = _get_pinv(leg_linear.num_coeffs)
             coeffs = torch.einsum("kl,loi->koi", pinv, weights.float())
             leg_linear.coeffs.data.copy_(coeffs.to(leg_linear.coeffs.dtype))
-            # Reset layer_scales to 1.0 (projection captures magnitude in coeffs)
             leg_linear.layer_scales.data.fill_(1.0)
 
         def _copy_biases(get_bias_fn, leg_linear: LegendreLinear):
-            """Copy per-layer biases directly."""
+            """Copy per-layer biases from middle blocks."""
             if leg_linear.bias is not None:
-                for i, blk in enumerate(encoder.blocks):
+                for i, blk in enumerate(middle_blocks):
                     bias = get_bias_fn(blk)
                     if bias is not None:
                         leg_linear.bias.data[i].copy_(bias.data)
 
-        # Attention in_proj (QKV)
+        # Project middle block weights into Legendre coefficients
         _stack_and_project(lambda blk: blk.attn.in_proj_weight, leg_encoder.attn_in_proj)
         _copy_biases(lambda blk: blk.attn.in_proj_bias, leg_encoder.attn_in_proj)
-
-        # Attention out_proj
         _stack_and_project(lambda blk: blk.attn.out_proj.weight, leg_encoder.attn_out_proj)
         _copy_biases(lambda blk: blk.attn.out_proj.bias, leg_encoder.attn_out_proj)
-
-        # FFN linear1
         _stack_and_project(lambda blk: blk.linear1.weight, leg_encoder.ff1)
         _copy_biases(lambda blk: blk.linear1.bias, leg_encoder.ff1)
-
-        # FFN linear2
         _stack_and_project(lambda blk: blk.linear2.weight, leg_encoder.ff2)
         _copy_biases(lambda blk: blk.linear2.bias, leg_encoder.ff2)
 
-        # Copy per-layer non-parameterized components
-        for src_block, dst_block in zip(encoder.blocks, leg_encoder.blocks):
-            dst_block.norm1.load_state_dict(src_block.norm1.state_dict())
-            dst_block.norm2.load_state_dict(src_block.norm2.state_dict())
-            if src_block.attn.ssmax_layer is not None:
-                dst_block.ssmax_layer.load_state_dict(src_block.attn.ssmax_layer.state_dict())
+        # Copy per-block components
+        for i, (src_block, dst_block) in enumerate(zip(encoder.blocks, leg_encoder.blocks)):
+            if leg_encoder._is_independent(i):
+                # Independent block — copy full state_dict
+                dst_block.load_state_dict(src_block.state_dict())
+            else:
+                # Legendre block — copy LayerNorm and SSMax
+                dst_block.norm1.load_state_dict(src_block.norm1.state_dict())
+                dst_block.norm2.load_state_dict(src_block.norm2.state_dict())
+                if src_block.attn.ssmax_layer is not None:
+                    dst_block.ssmax_layer.load_state_dict(src_block.attn.ssmax_layer.state_dict())
 
         return leg_encoder
