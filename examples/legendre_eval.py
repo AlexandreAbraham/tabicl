@@ -112,7 +112,8 @@ def main():
     print(summary)
 
     # Parameter counts (need a model to count from)
-    clf.fit(*load_dataset(*DATASETS[0])[:2])
+    X_tr, X_te, y_tr, y_te, _ = load_dataset(*DATASETS[0])
+    clf.fit(X_tr, y_tr)
     orig_enc = clf.model_.icl_predictor.tf_icl
     orig_params = count_params(orig_enc)
 
