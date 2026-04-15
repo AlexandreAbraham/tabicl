@@ -91,8 +91,9 @@ def main():
             if nc is not None:
                 # Swap encoder AFTER fit, then predict without re-fitting
                 orig_enc = clf.model_.icl_predictor.tf_icl
+                device = next(orig_enc.parameters()).device
                 leg_enc = LegendreEncoder.from_encoder(orig_enc, num_coeffs=nc)
-                leg_enc.eval()
+                leg_enc.eval().to(device)
                 clf.model_.icl_predictor.tf_icl = leg_enc
 
             preds = clf.predict(X_test)

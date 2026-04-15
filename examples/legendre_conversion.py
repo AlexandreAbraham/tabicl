@@ -83,8 +83,9 @@ def main():
             continue
 
         # Replace the ICL encoder in-place (no re-fitting!)
+        device = next(icl_encoder.parameters()).device
         leg_enc = LegendreEncoder.from_encoder(icl_encoder, num_coeffs=num_coeffs)
-        leg_enc.eval()
+        leg_enc.eval().to(device)
         model.icl_predictor.tf_icl = leg_enc
 
         preds = clf.predict(X_test)
