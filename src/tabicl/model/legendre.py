@@ -66,7 +66,12 @@ class LegendreLinear(nn.Module):
     """A linear layer whose weights are reconstructed from Legendre coefficients.
 
     Stores ``num_coeffs`` coefficient matrices and reconstructs ``num_layers``
-    virtual weight matrices on the fly.
+    virtual weight matrices on the fly. Each virtual layer also has a learned
+    scalar that adjusts magnitude independently (cheap per-layer expressivity).
+
+    Coefficients are initialized with order-dependent decay: C_k gets
+    std * 0.5^k, so that C_0 captures the "mean" weight across depth and
+    higher orders capture progressively finer variation.
 
     Parameters
     ----------
@@ -97,8 +102,12 @@ class LegendreLinear(nn.Module):
         self.in_features = in_features
 
         # Learnable coefficient matrices: (num_coeffs, out_features, in_features)
+        # Initialized with order-dependent decay: C_k gets std * 0.5^k
         self.coeffs = nn.Parameter(torch.empty(num_coeffs, out_features, in_features))
-        nn.init.normal_(self.coeffs, std=0.02 / num_coeffs**0.5)
+        self._init_coeffs()
+
+        # Per-layer scalar for magnitude adjustment (cheap per-layer expressivity)
+        self.layer_scales = nn.Parameter(torch.ones(num_layers))
 
         if bias:
             # Per-layer biases are small, keep them as free parameters
@@ -109,6 +118,19 @@ class LegendreLinear(nn.Module):
         # Precompute and register the basis matrix
         self.register_buffer("basis", legendre_basis(num_layers, num_coeffs))
 
+    def _init_coeffs(self):
+        """Initialize coefficients with order-dependent decay.
+
+        C_0 (the "mean" weight) gets the largest initialization. Higher
+        polynomial orders get progressively smaller init (0.5^k decay),
+        reflecting that fine depth variation should start small.
+        """
+        std = 1.0 / (self.in_features ** 0.5)
+        with torch.no_grad():
+            for k in range(self.num_coeffs):
+                decay = 0.5 ** k
+                nn.init.normal_(self.coeffs[k], std=std * decay)
+
     def reconstruct_weights(self) -> Tensor:
         """Reconstruct all layer weights from coefficients.
 
@@ -118,7 +140,8 @@ class LegendreLinear(nn.Module):
             Weight tensor of shape (num_layers, out_features, in_features).
         """
         # basis: (L, K), coeffs: (K, O, I) -> weights: (L, O, I)
-        return torch.einsum("lk,koi->loi", self.basis, self.coeffs)
+        W = torch.einsum("lk,koi->loi", self.basis, self.coeffs)
+        return self.layer_scales[:, None, None] * W
 
     def get_weight(self, layer_idx: int) -> Tensor:
         """Get reconstructed weight for a single layer.
@@ -134,7 +157,8 @@ class LegendreLinear(nn.Module):
             Weight matrix of shape (out_features, in_features).
         """
         # basis[layer_idx]: (K,), coeffs: (K, O, I) -> (O, I)
-        return torch.einsum("k,koi->oi", self.basis[layer_idx], self.coeffs)
+        W = torch.einsum("k,koi->oi", self.basis[layer_idx], self.coeffs)
+        return self.layer_scales[layer_idx] * W
 
     def get_bias(self, layer_idx: int) -> Optional[Tensor]:
         """Get bias for a single layer."""
@@ -379,7 +403,7 @@ class LegendreEncoder(nn.Module):
     num_blocks : int
         Number of virtual transformer blocks to reconstruct.
     num_coeffs : int
-        Number of Legendre polynomial coefficients per weight group.
+        Number of Legendre polynomial coefficients for attention weights.
     d_model : int
         Model dimension.
     nhead : int
@@ -404,6 +428,11 @@ class LegendreEncoder(nn.Module):
         SSMax type.
     recompute : bool
         Use gradient checkpointing.
+    num_coeffs_ffn : int or None
+        Number of Legendre coefficients for FFN weights. If None, uses the
+        same as ``num_coeffs`` (the attention value). FFN weights are often
+        more compressible than attention weights, so fewer coefficients may
+        suffice (e.g., num_coeffs=6 for attention, num_coeffs_ffn=3 for FFN).
     """
 
     def __init__(
@@ -422,31 +451,32 @@ class LegendreEncoder(nn.Module):
         rope_interleaved: bool = True,
         ssmax: Union[bool, str] = False,
         recompute: bool = False,
+        num_coeffs_ffn: Optional[int] = None,
     ):
         super().__init__()
 
         if d_model % nhead != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
 
+        if num_coeffs_ffn is None:
+            num_coeffs_ffn = num_coeffs
+
         self.num_blocks = num_blocks
         self.num_coeffs = num_coeffs
+        self.num_coeffs_ffn = num_coeffs_ffn
         self.d_model = d_model
         self.nhead = nhead
         self.dim_feedforward = dim_feedforward
         self.recompute = recompute
 
         # Legendre-parameterized weight groups
-        # 1. Attention in_proj (QKV): (3*d_model, d_model)
+        # Attention weights: higher degree for more expressivity
         self.attn_in_proj = LegendreLinear(num_blocks, num_coeffs, 3 * d_model, d_model, bias=True)
-
-        # 2. Attention out_proj: (d_model, d_model)
         self.attn_out_proj = LegendreLinear(num_blocks, num_coeffs, d_model, d_model, bias=True)
 
-        # 3. FFN linear1: (dim_feedforward, d_model)
-        self.ff1 = LegendreLinear(num_blocks, num_coeffs, dim_feedforward, d_model, bias=True)
-
-        # 4. FFN linear2: (d_model, dim_feedforward)
-        self.ff2 = LegendreLinear(num_blocks, num_coeffs, d_model, dim_feedforward, bias=True)
+        # FFN weights: potentially fewer coefficients (more compressible)
+        self.ff1 = LegendreLinear(num_blocks, num_coeffs_ffn, dim_feedforward, d_model, bias=True)
+        self.ff2 = LegendreLinear(num_blocks, num_coeffs_ffn, d_model, dim_feedforward, bias=True)
 
         # Per-layer shells (hold LayerNorm, dropout, SSMax)
         self.blocks = nn.ModuleList(
@@ -617,7 +647,7 @@ class LegendreEncoder(nn.Module):
         return out
 
     @staticmethod
-    def from_encoder(encoder, num_coeffs: int) -> "LegendreEncoder":
+    def from_encoder(encoder, num_coeffs: int, num_coeffs_ffn: Optional[int] = None) -> "LegendreEncoder":
         """Create a LegendreEncoder warm-started from a pretrained standard Encoder.
 
         Fits Legendre coefficients via least-squares projection of the pretrained
@@ -628,7 +658,10 @@ class LegendreEncoder(nn.Module):
         encoder : Encoder
             A pretrained standard Encoder instance.
         num_coeffs : int
-            Number of Legendre coefficients to use.
+            Number of Legendre coefficients for attention weights.
+        num_coeffs_ffn : int or None
+            Number of Legendre coefficients for FFN weights. If None, uses
+            ``num_coeffs``.
 
         Returns
         -------
@@ -687,6 +720,7 @@ class LegendreEncoder(nn.Module):
             rope_interleaved=rope_interleaved,
             ssmax=ssmax,
             recompute=encoder.recompute,
+            num_coeffs_ffn=num_coeffs_ffn,
         )
 
         # Copy RoPE if present
@@ -695,15 +729,24 @@ class LegendreEncoder(nn.Module):
 
         # Collect per-layer weights from the pretrained encoder
         device = block0.attn.in_proj_weight.device
-        basis = legendre_basis(num_blocks, num_coeffs, device=device).float()
-        basis_pinv = torch.linalg.pinv(basis)  # (K, L)
+
+        # Precompute pseudo-inverses for each coefficient count
+        _pinv_cache = {}
+        def _get_pinv(nc):
+            if nc not in _pinv_cache:
+                basis = legendre_basis(num_blocks, nc, device=device).float()
+                _pinv_cache[nc] = torch.linalg.pinv(basis)
+            return _pinv_cache[nc]
 
         # Stack weights along layer dimension and project
         def _stack_and_project(get_param_fn, leg_linear: LegendreLinear):
             """Stack per-layer params and fit Legendre coefficients via least-squares."""
             weights = torch.stack([get_param_fn(blk) for blk in encoder.blocks], dim=0)  # (L, O, I)
-            coeffs = torch.einsum("kl,loi->koi", basis_pinv, weights.float())
+            pinv = _get_pinv(leg_linear.num_coeffs)
+            coeffs = torch.einsum("kl,loi->koi", pinv, weights.float())
             leg_linear.coeffs.data.copy_(coeffs.to(leg_linear.coeffs.dtype))
+            # Reset layer_scales to 1.0 (projection captures magnitude in coeffs)
+            leg_linear.layer_scales.data.fill_(1.0)
 
         def _copy_biases(get_bias_fn, leg_linear: LegendreLinear):
             """Copy per-layer biases directly."""

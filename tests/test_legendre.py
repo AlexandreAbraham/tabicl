@@ -68,6 +68,35 @@ class TestLegendreLinear:
         assert ll.bias is None
         assert ll.get_bias(0) is None
 
+    def test_layer_scales(self):
+        """Per-layer scales should be applied to reconstructed weights."""
+        ll = LegendreLinear(4, 2, 16, 8)
+        with torch.no_grad():
+            ll.layer_scales[0] = 2.0
+            ll.layer_scales[1] = 0.5
+        W = ll.reconstruct_weights()
+        # With scale=2, layer 0 should be 2x the unscaled value
+        ll.layer_scales.data.fill_(1.0)
+        W_unscaled = ll.reconstruct_weights()
+        assert torch.allclose(W[0], 2.0 * W_unscaled[0], atol=1e-5)
+
+    def test_layer_scales_gradient(self):
+        """Gradients should flow to layer_scales."""
+        ll = LegendreLinear(4, 2, 16, 8)
+        x = torch.randn(2, 5, 8)
+        W = ll.reconstruct_weights()
+        out = torch.nn.functional.linear(x, W[0])
+        out.sum().backward()
+        assert ll.layer_scales.grad is not None
+
+    def test_order_decaying_init(self):
+        """Higher-order coefficients should have smaller magnitude at init."""
+        ll = LegendreLinear(8, 6, 64, 32)
+        norms = [ll.coeffs[k].norm().item() for k in range(6)]
+        # Each order should be roughly half the previous (with randomness)
+        for k in range(1, 6):
+            assert norms[k] < norms[k - 1], f"Order {k} norm ({norms[k]}) >= order {k-1} norm ({norms[k-1]})"
+
 
 class TestLegendreEncoder:
     @pytest.fixture
@@ -105,6 +134,24 @@ class TestLegendreEncoder:
         assert enc.attn_out_proj.coeffs.grad is not None
         assert enc.ff1.coeffs.grad is not None
         assert enc.ff2.coeffs.grad is not None
+
+    def test_separate_ffn_coeffs(self, encoder_kwargs):
+        """Attention and FFN can have different number of coefficients."""
+        enc = LegendreEncoder(num_coeffs=6, num_coeffs_ffn=3, **encoder_kwargs)
+        assert enc.attn_in_proj.num_coeffs == 6
+        assert enc.attn_out_proj.num_coeffs == 6
+        assert enc.ff1.num_coeffs == 3
+        assert enc.ff2.num_coeffs == 3
+
+        x = torch.randn(2, 10, 64)
+        out = enc(x)
+        assert out.shape == (2, 10, 64)
+
+        # Should have fewer params than uniform 6 coeffs
+        enc_uniform = LegendreEncoder(num_coeffs=6, **encoder_kwargs)
+        params_split = sum(p.numel() for p in enc.parameters())
+        params_uniform = sum(p.numel() for p in enc_uniform.parameters())
+        assert params_split < params_uniform
 
     def test_forward_with_rope(self, encoder_kwargs):
         enc = LegendreEncoder(num_coeffs=4, use_rope=True, **encoder_kwargs)

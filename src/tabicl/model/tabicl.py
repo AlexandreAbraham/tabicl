@@ -142,12 +142,20 @@ class TabICL(nn.Module):
 
     row_legendre_coeffs : int or None, default=None
         If set, uses Legendre polynomial weight parameterization for the row
-        interaction encoder with this many coefficients.
+        interaction encoder with this many coefficients for attention weights.
 
     icl_legendre_coeffs : int or None, default=None
         If set, uses Legendre polynomial weight parameterization for the ICL
-        encoder with this many coefficients. For example, with icl_num_blocks=12
-        and icl_legendre_coeffs=6, this provides ~2x weight compression.
+        encoder with this many coefficients for attention weights.
+
+    row_legendre_coeffs_ffn : int or None, default=None
+        Number of Legendre coefficients for FFN weights in row encoder.
+        If None, uses ``row_legendre_coeffs``.
+
+    icl_legendre_coeffs_ffn : int or None, default=None
+        Number of Legendre coefficients for FFN weights in ICL encoder.
+        If None, uses ``icl_legendre_coeffs``. FFN weights are often more
+        compressible, so fewer coefficients may suffice.
     """
 
     def __init__(
@@ -199,6 +207,8 @@ class TabICL(nn.Module):
         recompute: bool = False,
         row_legendre_coeffs: Optional[int] = None,
         icl_legendre_coeffs: Optional[int] = None,
+        row_legendre_coeffs_ffn: Optional[int] = None,
+        icl_legendre_coeffs_ffn: Optional[int] = None,
     ):
         super().__init__()
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
@@ -238,6 +248,8 @@ class TabICL(nn.Module):
         self.bias_free_ln = bias_free_ln
         self.row_legendre_coeffs = row_legendre_coeffs
         self.icl_legendre_coeffs = icl_legendre_coeffs
+        self.row_legendre_coeffs_ffn = row_legendre_coeffs_ffn
+        self.icl_legendre_coeffs_ffn = icl_legendre_coeffs_ffn
 
         self.col_embedder = ColEmbedding(
             embed_dim=embed_dim,
@@ -273,6 +285,7 @@ class TabICL(nn.Module):
             bias_free_ln=bias_free_ln,
             recompute=recompute,
             legendre_coeffs=row_legendre_coeffs,
+            legendre_coeffs_ffn=row_legendre_coeffs_ffn,
         )
 
         self.icl_predictor = ICLearning(
@@ -289,6 +302,7 @@ class TabICL(nn.Module):
             ssmax=icl_ssmax,
             recompute=recompute,
             legendre_coeffs=icl_legendre_coeffs,
+            legendre_coeffs_ffn=icl_legendre_coeffs_ffn,
         )
 
         # KV cache for efficient inference

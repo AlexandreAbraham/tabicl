@@ -65,7 +65,11 @@ class RowInteraction(nn.Module):
 
     legendre_coeffs : int or None, default=None
         If set, uses Legendre polynomial weight parameterization with this many
-        coefficients instead of independent per-layer weights.
+        coefficients for attention weights.
+
+    legendre_coeffs_ffn : int or None, default=None
+        Number of Legendre coefficients for FFN weights. If None, uses
+        ``legendre_coeffs``.
     """
 
     def __init__(
@@ -83,6 +87,7 @@ class RowInteraction(nn.Module):
         bias_free_ln: bool = False,
         recompute: bool = False,
         legendre_coeffs: Optional[int] = None,
+        legendre_coeffs_ffn: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -108,6 +113,7 @@ class RowInteraction(nn.Module):
         )
         if legendre_coeffs is not None:
             encoder_kwargs["num_coeffs"] = legendre_coeffs
+            encoder_kwargs["num_coeffs_ffn"] = legendre_coeffs_ffn
 
         self.tf_row = encoder_cls(**encoder_kwargs)
 

@@ -72,9 +72,11 @@ class ICLearning(nn.Module):
 
     legendre_coeffs : int or None, default=None
         If set, uses Legendre polynomial weight parameterization with this many
-        coefficients instead of independent per-layer weights. Provides
-        ~(num_blocks / legendre_coeffs)x compression on weight storage and
-        optimizer memory.
+        coefficients for attention weights.
+
+    legendre_coeffs_ffn : int or None, default=None
+        Number of Legendre coefficients for FFN weights. If None, uses
+        ``legendre_coeffs``. FFN weights are often more compressible.
     """
 
     def __init__(
@@ -92,6 +94,7 @@ class ICLearning(nn.Module):
         ssmax: Union[bool, str] = False,
         recompute: bool = False,
         legendre_coeffs: Optional[int] = None,
+        legendre_coeffs_ffn: Optional[int] = None,
     ):
         super().__init__()
 
@@ -113,6 +116,7 @@ class ICLearning(nn.Module):
         )
         if legendre_coeffs is not None:
             encoder_kwargs["num_coeffs"] = legendre_coeffs
+            encoder_kwargs["num_coeffs_ffn"] = legendre_coeffs_ffn
 
         self.tf_icl = encoder_cls(**encoder_kwargs)
         if self.norm_first:
