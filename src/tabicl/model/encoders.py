@@ -11,7 +11,24 @@ from .layers import MultiheadAttentionBlock, InducedSelfAttentionBlock
 from .kv_cache import KVCacheEntry, KVCache
 
 
-class Encoder(nn.Module):
+class _EncoderBase(nn.Module):
+    """Mixin that provides ``call_block`` for use by RowInteraction.
+
+    RowInteraction._aggregate_embeddings iterates over blocks individually
+    with custom arguments (key_padding_mask, separate q/k/v). This method
+    provides a unified interface for both Encoder and LegendreEncoder.
+    """
+
+    def call_block(self, block_idx: int, *args, **kwargs):
+        """Call a single block by index, forwarding all arguments.
+
+        Used by RowInteraction._aggregate_embeddings which calls blocks
+        individually with custom arguments (key_padding_mask, separate q/k/v).
+        """
+        return self.blocks[block_idx](*args, **kwargs)
+
+
+class Encoder(_EncoderBase):
     """Stack of multihead attention blocks.
 
     Parameters

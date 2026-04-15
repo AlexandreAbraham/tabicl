@@ -9,6 +9,7 @@ from torch import nn, Tensor
 from torch.utils.checkpoint import checkpoint
 
 from .encoders import Encoder
+from .legendre import LegendreEncoder
 from .inference import InferenceManager
 from .inference_config import MgrConfig, InferenceConfig
 
@@ -61,6 +62,10 @@ class RowInteraction(nn.Module):
 
     recompute : bool, default=False
         If True, uses gradient checkpointing to save memory at the cost of additional computation.
+
+    legendre_coeffs : int or None, default=None
+        If set, uses Legendre polynomial weight parameterization with this many
+        coefficients instead of independent per-layer weights.
     """
 
     def __init__(
@@ -77,6 +82,7 @@ class RowInteraction(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         recompute: bool = False,
+        legendre_coeffs: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -85,7 +91,8 @@ class RowInteraction(nn.Module):
         self.norm_first = norm_first
         self.recompute = recompute
 
-        self.tf_row = Encoder(
+        encoder_cls = Encoder if legendre_coeffs is None else LegendreEncoder
+        encoder_kwargs = dict(
             num_blocks=num_blocks,
             d_model=embed_dim,
             nhead=nhead,
@@ -99,6 +106,10 @@ class RowInteraction(nn.Module):
             rope_interleaved=rope_interleaved,
             recompute=recompute,
         )
+        if legendre_coeffs is not None:
+            encoder_kwargs["num_coeffs"] = legendre_coeffs
+
+        self.tf_row = encoder_cls(**encoder_kwargs)
 
         self.cls_tokens = nn.Parameter(torch.empty(num_cls, embed_dim))
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
@@ -135,29 +146,34 @@ class RowInteraction(nn.Module):
             Flattened class token outputs of shape (B*T, C*E).
         """
         rope = self.tf_row.rope
+        num_blocks = len(self.tf_row.blocks)
 
         # Process all blocks except the last
         if self.recompute:
-            for block in self.tf_row.blocks[:-1]:
+            for i in range(num_blocks - 1):
                 embeddings = checkpoint(
-                    partial(block, key_padding_mask=key_mask, rope=rope), embeddings, use_reentrant=False
+                    partial(self.tf_row.call_block, i, key_padding_mask=key_mask, rope=rope),
+                    embeddings,
+                    use_reentrant=False,
                 )
         else:
-            for block in self.tf_row.blocks[:-1]:
-                embeddings = block(embeddings, key_padding_mask=key_mask, rope=rope)
+            for i in range(num_blocks - 1):
+                embeddings = self.tf_row.call_block(i, q=embeddings, key_padding_mask=key_mask, rope=rope)
 
         # Last block: q = CLS tokens, k/v = full sequence
-        last_block = self.tf_row.blocks[-1]
+        last_idx = num_blocks - 1
         if self.recompute:
             cls_outputs = checkpoint(
-                lambda emb: last_block(
+                lambda emb: self.tf_row.call_block(
+                    last_idx,
                     q=emb[..., : self.num_cls, :], k=emb, v=emb, key_padding_mask=key_mask, rope=rope
                 ),
                 embeddings,
                 use_reentrant=False,
             )
         else:
-            cls_outputs = last_block(
+            cls_outputs = self.tf_row.call_block(
+                last_idx,
                 q=embeddings[..., : self.num_cls, :], k=embeddings, v=embeddings, key_padding_mask=key_mask, rope=rope
             )
         del embeddings

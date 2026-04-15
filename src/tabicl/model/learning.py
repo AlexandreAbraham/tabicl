@@ -8,6 +8,7 @@ from torch import nn, Tensor
 
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
+from .legendre import LegendreEncoder
 from .kv_cache import KVCache
 from .inference import InferenceManager
 from .inference_config import MgrConfig, InferenceConfig
@@ -68,6 +69,12 @@ class ICLearning(nn.Module):
 
     recompute : bool, default=False
         If True, uses gradient checkpointing to save memory at the cost of additional computation.
+
+    legendre_coeffs : int or None, default=None
+        If set, uses Legendre polynomial weight parameterization with this many
+        coefficients instead of independent per-layer weights. Provides
+        ~(num_blocks / legendre_coeffs)x compression on weight storage and
+        optimizer memory.
     """
 
     def __init__(
@@ -84,13 +91,15 @@ class ICLearning(nn.Module):
         bias_free_ln: bool = False,
         ssmax: Union[bool, str] = False,
         recompute: bool = False,
+        legendre_coeffs: Optional[int] = None,
     ):
         super().__init__()
 
         self.max_classes = max_classes
         self.norm_first = norm_first
 
-        self.tf_icl = Encoder(
+        encoder_cls = Encoder if legendre_coeffs is None else LegendreEncoder
+        encoder_kwargs = dict(
             num_blocks=num_blocks,
             d_model=d_model,
             nhead=nhead,
@@ -102,6 +111,10 @@ class ICLearning(nn.Module):
             ssmax=ssmax,
             recompute=recompute,
         )
+        if legendre_coeffs is not None:
+            encoder_kwargs["num_coeffs"] = legendre_coeffs
+
+        self.tf_icl = encoder_cls(**encoder_kwargs)
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
 

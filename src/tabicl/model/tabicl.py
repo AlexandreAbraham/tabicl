@@ -139,6 +139,15 @@ class TabICL(nn.Module):
 
     recompute : bool, default=False
         If True, uses gradient checkpointing to save memory at the cost of additional computation.
+
+    row_legendre_coeffs : int or None, default=None
+        If set, uses Legendre polynomial weight parameterization for the row
+        interaction encoder with this many coefficients.
+
+    icl_legendre_coeffs : int or None, default=None
+        If set, uses Legendre polynomial weight parameterization for the ICL
+        encoder with this many coefficients. For example, with icl_num_blocks=12
+        and icl_legendre_coeffs=6, this provides ~2x weight compression.
     """
 
     def __init__(
@@ -188,6 +197,8 @@ class TabICL(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         recompute: bool = False,
+        row_legendre_coeffs: Optional[int] = None,
+        icl_legendre_coeffs: Optional[int] = None,
     ):
         super().__init__()
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
@@ -225,6 +236,8 @@ class TabICL(nn.Module):
         self.activation = activation
         self.norm_first = norm_first
         self.bias_free_ln = bias_free_ln
+        self.row_legendre_coeffs = row_legendre_coeffs
+        self.icl_legendre_coeffs = icl_legendre_coeffs
 
         self.col_embedder = ColEmbedding(
             embed_dim=embed_dim,
@@ -259,6 +272,7 @@ class TabICL(nn.Module):
             norm_first=norm_first,
             bias_free_ln=bias_free_ln,
             recompute=recompute,
+            legendre_coeffs=row_legendre_coeffs,
         )
 
         self.icl_predictor = ICLearning(
@@ -274,6 +288,7 @@ class TabICL(nn.Module):
             bias_free_ln=bias_free_ln,
             ssmax=icl_ssmax,
             recompute=recompute,
+            legendre_coeffs=icl_legendre_coeffs,
         )
 
         # KV cache for efficient inference
