@@ -72,6 +72,8 @@ def main():
         print(f"{num_coeffs:>8} {leg_params:>12,} {compression:>11.2f}x {recon_err:>12.6f}")
 
     # ── 4. Full end-to-end evaluation with compressed model ──
+    # NOTE: clf.fit() reloads the model from checkpoint, so we must swap
+    # the encoder AFTER fit() and call predict() WITHOUT re-fitting.
     print("\n── End-to-end accuracy with Legendre compression ──")
     print(f"{'Coeffs':>8} {'Accuracy':>10} {'Δ vs baseline':>14}")
     print("-" * 35)
@@ -80,7 +82,7 @@ def main():
         if num_coeffs < 1 or num_coeffs > num_blocks:
             continue
 
-        # Replace the ICL encoder in-place
+        # Replace the ICL encoder in-place (no re-fitting!)
         leg_enc = LegendreEncoder.from_encoder(icl_encoder, num_coeffs=num_coeffs)
         leg_enc.eval()
         model.icl_predictor.tf_icl = leg_enc
