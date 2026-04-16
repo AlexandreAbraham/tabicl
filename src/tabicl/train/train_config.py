@@ -194,6 +194,24 @@ def build_parser():
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
+    # Legendre Compression Config
+    parser.add_argument(
+        "--icl_legendre_coeffs", type=int, default=None,
+        help="Number of Legendre coefficients for ICL attention weights. None = standard encoder.",
+    )
+    parser.add_argument(
+        "--icl_legendre_coeffs_ffn", type=int, default=None,
+        help="Number of Legendre coefficients for ICL FFN weights. None = same as icl_legendre_coeffs.",
+    )
+    parser.add_argument(
+        "--row_legendre_coeffs", type=int, default=None,
+        help="Number of Legendre coefficients for row attention weights. None = standard encoder.",
+    )
+    parser.add_argument(
+        "--row_legendre_coeffs_ffn", type=int, default=None,
+        help="Number of Legendre coefficients for row FFN weights. None = same as row_legendre_coeffs.",
+    )
+
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout probability")

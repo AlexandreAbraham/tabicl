@@ -184,6 +184,10 @@ class Trainer:
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "icl_legendre_coeffs": self.config.icl_legendre_coeffs,
+            "icl_legendre_coeffs_ffn": self.config.icl_legendre_coeffs_ffn,
+            "row_legendre_coeffs": self.config.row_legendre_coeffs,
+            "row_legendre_coeffs_ffn": self.config.row_legendre_coeffs_ffn,
         }
 
         model = TabICL(**self.model_config)
