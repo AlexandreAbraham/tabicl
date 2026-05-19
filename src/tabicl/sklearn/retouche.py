@@ -88,7 +88,7 @@ class CrossBlock(nn.Module):
         x = x0
         for l in range(self.num_layers):
             inner = self._Wx(x, l) + self.b[l]
-            inner = self.bn[l](inner)
+            inner = _safe_bn(self.bn[l], inner)
             x = x0 * inner + x
         return x
 
@@ -124,8 +124,21 @@ class ResMLPBlock(nn.Module):
         x = x0
         for l in range(self.num_layers):
             h = self.W2[l](self.act(self.W1[l](x)))
-            x = x + self.bn[l](h)
+            x = x + _safe_bn(self.bn[l], h)
         return x
+
+
+def _safe_bn(bn: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Apply BN but skip if training mode and batch < 2 (avoids the
+    'Expected more than 1 value per channel' crash). When skipping we still
+    let running stats stay frozen — the layer is essentially a passthrough
+    for that step. In eval mode BN uses running stats so any batch size is OK.
+    """
+    if isinstance(bn, nn.Identity):
+        return x
+    if bn.training and x.shape[0] < 2:
+        return x
+    return bn(x)
 
 
 def _resolve_activation(name: Optional[str]):
@@ -622,38 +635,65 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
         param_groups = [g for g in param_groups if g["params"]]
         optimizer = torch.optim.AdamW(param_groups, betas=self.betas)
 
-        # Resolve max_context. 'auto' picks a value that fits a single
-        # differentiable forward on L40S-class memory (~44 GB) for typical
-        # d_back ≤ 500 — empirically a context of ~6k rows leaves headroom for
-        # the val side and Adam state.
+        # Training data only — the guard val (X_va) is held out throughout
+        # training and used solely by the identity guard at the end (§3.5).
+        # Each epoch we partition the TRAINING data into context C and query
+        # Q (§3.4: "the training data are randomly partitioned into a context
+        # set C and a query set Q, matching the in-context-learning setting").
+        # The query LABELS provide the loss target; query INPUTS are scored
+        # via TabICL.predict_differentiable conditioned on C.
+
+        # Resolve max_context. Paper Appendix G caps at 15k–60k; for L40S
+        # safety we default to 6k.
         n_train = X_tr_num.shape[0] if X_tr_num.numel() else len(y_tr_t)
         if self.max_context == "auto":
-            max_ctx = min(n_train, 6000)
+            max_ctx = min(n_train - 1, 6000)
         elif self.max_context is None:
-            max_ctx = n_train
+            max_ctx = n_train - 1
         else:
-            max_ctx = min(n_train, int(self.max_context))
+            max_ctx = min(n_train - 1, int(self.max_context))
+        # Always leave at least a few rows for the query
+        max_ctx = max(max_ctx, n_train // 2)
+        max_q_train = n_train - max_ctx
         self._max_context_ = max_ctx
+        self._max_query_ = max_q_train
 
-        n_val = len(y_va_t)
-        max_q = n_val if self.max_query is None else min(n_val, int(self.max_query))
-        self._max_query_ = max_q
-
+        # For early stopping we score a fixed-shuffle held-out slice of train
+        # (separate from the per-epoch reshuffled C/Q). This monitors val-like
+        # loss without leaking into gradients. The slice is held in memory
+        # but NEVER appears in the query set used for training loss.
         rng = np.random.RandomState(self.random_state or 0)
-        y_tr_np = y_tr  # for stratified resampling
-        y_va_np = y_va
+        # Hold out at most ~30% of train for early stopping; on tiny datasets
+        # cap small enough to leave a usable train pool (≥ 4 rows).
+        max_es = max(0, n_train - 4)
+        n_es = min(max_es, max(0, min(int(0.1 * n_train), 1000)))
+        if n_es == 0:
+            es_idx_np = np.empty(0, dtype=np.int64)
+        else:
+            es_idx_np = _stratified_sample(rng, y_tr, n_es)
+        es_mask = np.zeros(n_train, dtype=bool)
+        es_mask[es_idx_np] = True
+        train_pool_idx = np.where(~es_mask)[0]
+        es_idx = torch.from_numpy(es_idx_np).long().to(device)
+        train_pool_idx_t = torch.from_numpy(train_pool_idx).long().to(device)
+        y_train_pool_np = y_tr[train_pool_idx]
+        n_train_pool = len(train_pool_idx)
+        # Re-tighten max_ctx to fit in the train pool (excluding es slice).
+        # Leave at least 2 rows for the query (BN won't crash, plus single-row
+        # query has no useful gradient signal).
+        max_ctx = min(max_ctx, max(1, n_train_pool - 2))
+        max_q_train = max(2, n_train_pool - max_ctx)
 
-        # first call to set up the backbone with a fixed dummy subset (just to
-        # initialise z-norm stats — overwritten every epoch below)
+        # init backbone with one dummy forward — just to set up z-norm stats
         with torch.no_grad():
-            ctx_idx0 = _stratified_sample(rng, y_tr_np, max_ctx)
-            x_pre = self.preproc_(X_tr_num[ctx_idx0], [t[ctx_idx0] for t in X_tr_cat])
+            x_pre = self.preproc_(X_tr_num[train_pool_idx_t],
+                                  [t[train_pool_idx_t] for t in X_tr_cat])
             x_post = self.adapter_(x_pre)
             x_back = x_post @ self._proj_ if self.use_proj_ else x_post
-        self.clf_.fit_with_differentiable_input(x_back.detach(), y_tr_t[ctx_idx0])
+        self.clf_.fit_with_differentiable_input(x_back.detach(), y_tr_t[train_pool_idx_t])
 
         # training loop
-        best_val = float("inf")
+        best_es = float("inf")
         best_state = None
         bad_epochs = 0
 
@@ -667,31 +707,39 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
             self.adapter_.train()
             self.preproc_.train()
 
-            # Reshuffle context and query each epoch (paper Appendix G).
-            ctx_idx = _stratified_sample(rng, y_tr_np, max_ctx)
-            q_idx = _stratified_sample(rng, y_va_np, max_q)
-            ctx_idx_t = torch.from_numpy(ctx_idx).long().to(device)
-            q_idx_t = torch.from_numpy(q_idx).long().to(device)
+            # Random partition of train pool into context C and query Q.
+            # Stratify-sample the context, then the query is what's left.
+            ctx_local = _stratified_sample(rng, y_train_pool_np, max_ctx)
+            ctx_set = set(ctx_local.tolist())
+            q_local = np.array([i for i in range(n_train_pool) if i not in ctx_set],
+                               dtype=np.int64)
+            if len(q_local) > max_q_train:
+                q_local = rng.choice(q_local, size=max_q_train, replace=False)
+            ctx_global = train_pool_idx[ctx_local]
+            q_global = train_pool_idx[q_local]
 
-            X_tr_num_e = X_tr_num[ctx_idx_t] if X_tr_num.numel() else X_tr_num
-            X_tr_cat_e = [t[ctx_idx_t] for t in X_tr_cat]
-            y_tr_e = y_tr_t[ctx_idx_t]
-            X_va_num_e = X_va_num[q_idx_t] if X_va_num.numel() else X_va_num
-            X_va_cat_e = [t[q_idx_t] for t in X_va_cat]
-            y_va_e = y_va_t[q_idx_t]
+            ctx_t = torch.from_numpy(ctx_global).long().to(device)
+            q_t = torch.from_numpy(q_global).long().to(device)
 
-            x_tr_pre = self.preproc_(X_tr_num_e, X_tr_cat_e)
-            x_tr_post = self.adapter_(x_tr_pre)
-            x_va_pre = self.preproc_(X_va_num_e, X_va_cat_e)
-            x_va_post = self.adapter_(x_va_pre)
+            X_ctx_num = X_tr_num[ctx_t] if X_tr_num.numel() else X_tr_num
+            X_ctx_cat = [t[ctx_t] for t in X_tr_cat]
+            y_ctx = y_tr_t[ctx_t]
+            X_q_num = X_tr_num[q_t] if X_tr_num.numel() else X_tr_num
+            X_q_cat = [t[q_t] for t in X_tr_cat]
+            y_q = y_tr_t[q_t]
 
-            x_tr_back = x_tr_post @ self._proj_ if self.use_proj_ else x_tr_post
-            x_va_back = x_va_post @ self._proj_ if self.use_proj_ else x_va_post
+            x_ctx_pre = self.preproc_(X_ctx_num, X_ctx_cat)
+            x_ctx_post = self.adapter_(x_ctx_pre)
+            x_q_pre = self.preproc_(X_q_num, X_q_cat)
+            x_q_post = self.adapter_(x_q_pre)
 
-            self.clf_.fit_with_differentiable_input(x_tr_back, y_tr_e)
-            logits = self.clf_.predict_differentiable(x_va_back, return_logits=True)
+            x_ctx_back = x_ctx_post @ self._proj_ if self.use_proj_ else x_ctx_post
+            x_q_back = x_q_post @ self._proj_ if self.use_proj_ else x_q_post
 
-            loss = F.cross_entropy(logits, y_va_e, label_smoothing=self.label_smoothing)
+            self.clf_.fit_with_differentiable_input(x_ctx_back, y_ctx)
+            logits = self.clf_.predict_differentiable(x_q_back, return_logits=True)
+
+            loss = F.cross_entropy(logits, y_q, label_smoothing=self.label_smoothing)
 
             optimizer.zero_grad()
             loss.backward()
@@ -701,14 +749,29 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
             torch.nn.utils.clip_grad_norm_(params_for_clip, self.max_grad_norm)
             optimizer.step()
 
+            # Early stopping: score the fixed ES slice with the train pool
+            # as context (no gradient).
+            self.adapter_.eval()
+            self.preproc_.eval()
             with torch.no_grad():
-                val_loss = float(loss.item())
+                x_pool_pre = self.preproc_(X_tr_num[train_pool_idx_t],
+                                           [t[train_pool_idx_t] for t in X_tr_cat])
+                x_pool_post = self.adapter_(x_pool_pre)
+                x_pool_back = x_pool_post @ self._proj_ if self.use_proj_ else x_pool_post
+                x_es_pre = self.preproc_(X_tr_num[es_idx],
+                                         [t[es_idx] for t in X_tr_cat])
+                x_es_post = self.adapter_(x_es_pre)
+                x_es_back = x_es_post @ self._proj_ if self.use_proj_ else x_es_post
+                self.clf_.fit_with_differentiable_input(x_pool_back, y_tr_t[train_pool_idx_t])
+                es_logits = self.clf_.predict_differentiable(x_es_back, return_logits=True)
+                es_loss = F.cross_entropy(es_logits, y_tr_t[es_idx]).item()
 
             if self.verbose:
-                print(f"[Retouche] epoch {epoch:3d}  val_loss={val_loss:.4f}  lr_mult={lr_mult:.3f}")
+                print(f"[Retouche] ep {epoch:3d}  q_loss={loss.item():.4f}  "
+                      f"es_loss={es_loss:.4f}  lr×{lr_mult:.3f}")
 
-            if val_loss + 1e-6 < best_val:
-                best_val = val_loss
+            if es_loss + 1e-6 < best_es:
+                best_es = es_loss
                 best_state = {
                     "adapter": {k: v.detach().clone() for k, v in self.adapter_.state_dict().items()},
                     "preproc": {k: v.detach().clone() for k, v in self.preproc_.state_dict().items()},
