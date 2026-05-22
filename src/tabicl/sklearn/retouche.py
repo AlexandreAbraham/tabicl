@@ -46,7 +46,7 @@ class CrossBlock(nn.Module):
     """
 
     def __init__(self, d: int, num_layers: int, low_rank_ratio: Optional[float],
-                 activation: Optional[str], use_batch_norm: bool):
+                 activation: Optional[str], use_batch_norm: bool, norm_type: str = "batch"):
         super().__init__()
         self.num_layers = num_layers
         self.low_rank = low_rank_ratio is not None
@@ -54,6 +54,7 @@ class CrossBlock(nn.Module):
         self.h = h
         self.act = _resolve_activation(activation)
         self.use_bn = use_batch_norm
+        self.norm_type = norm_type
 
         self.U = nn.ParameterList()
         self.V = nn.ParameterList()
@@ -74,7 +75,7 @@ class CrossBlock(nn.Module):
                 W = nn.Parameter(torch.zeros(d, d))
                 self.W.append(W)
             self.b.append(nn.Parameter(torch.zeros(d)))
-            self.bn.append(nn.BatchNorm1d(d) if use_batch_norm else nn.Identity())
+            self.bn.append(_make_norm(d, use_batch_norm, norm_type))
 
     def _Wx(self, x: torch.Tensor, l: int) -> torch.Tensor:
         if self.low_rank:
@@ -101,7 +102,8 @@ class ResMLPBlock(nn.Module):
     """
 
     def __init__(self, d: int, num_layers: int, low_rank_ratio: Optional[float],
-                 activation: Optional[str], use_batch_norm: bool, h_min: int = 2):
+                 activation: Optional[str], use_batch_norm: bool, h_min: int = 2,
+                 norm_type: str = "batch"):
         super().__init__()
         self.num_layers = num_layers
         h = max(h_min, int((low_rank_ratio or 0.25) * d))
@@ -118,7 +120,7 @@ class ResMLPBlock(nn.Module):
             nn.init.zeros_(l2.bias)
             self.W1.append(l1)
             self.W2.append(l2)
-            self.bn.append(nn.BatchNorm1d(d) if use_batch_norm else nn.Identity())
+            self.bn.append(_make_norm(d, use_batch_norm, norm_type))
 
     def forward(self, x0: torch.Tensor) -> torch.Tensor:
         x = x0
@@ -129,16 +131,31 @@ class ResMLPBlock(nn.Module):
 
 
 def _safe_bn(bn: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Apply BN but skip if training mode and batch < 2 (avoids the
-    'Expected more than 1 value per channel' crash). When skipping we still
-    let running stats stay frozen — the layer is essentially a passthrough
-    for that step. In eval mode BN uses running stats so any batch size is OK.
+    """Apply BN/LN but skip BN if training mode and batch < 2 (avoids the
+    'Expected more than 1 value per channel' crash). LayerNorm has no batch
+    coupling so it's always safe. Identity is passthrough.
     """
     if isinstance(bn, nn.Identity):
         return x
-    if bn.training and x.shape[0] < 2:
+    if isinstance(bn, nn.BatchNorm1d) and bn.training and x.shape[0] < 2:
         return x
     return bn(x)
+
+
+def _make_norm(d: int, use_norm: bool, norm_type: str) -> nn.Module:
+    """Build a norm layer per the requested type.
+
+    norm_type='batch' (paper default, BatchNorm1d)
+    norm_type='layer' (LayerNorm — no batch coupling, more stable under bagging)
+    use_norm=False → Identity (norm disabled entirely)
+    """
+    if not use_norm:
+        return nn.Identity()
+    if norm_type == "batch":
+        return nn.BatchNorm1d(d)
+    if norm_type == "layer":
+        return nn.LayerNorm(d)
+    raise ValueError(f"norm_type must be 'batch' or 'layer', got {norm_type!r}")
 
 
 def _resolve_activation(name: Optional[str]):
@@ -186,14 +203,62 @@ class GatedAdapter(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class _PLREncoder(nn.Module):
+    """Periodic-Linear-ReLU embedding (Gorishniy et al. 2023).
+
+    For each scalar feature x_i (shape (N,)), produces an embedding of size
+    ``d_emb`` via:  sin/cos(2π · c · x_i) (with K learnable frequencies) →
+    Linear(2K → d_emb) → ReLU.
+
+    Shared frequencies across features (the simpler 'P' variant); the linear
+    layer is per-feature. Output shape: (N, d_num × d_emb).
+    """
+
+    def __init__(self, d_num: int, n_freqs: int = 24, d_emb: int = 8,
+                 sigma: float = 1.0):
+        super().__init__()
+        self.d_num = d_num
+        self.n_freqs = n_freqs
+        self.d_emb = d_emb
+        # Learnable frequencies, init from N(0, sigma)
+        self.freqs = nn.Parameter(torch.randn(n_freqs) * sigma)
+        # Per-feature linear: each numeric column gets its own 2K → d_emb.
+        # Implemented as a packed (d_num, 2K, d_emb) tensor so we can do a
+        # single bmm instead of a Python loop.
+        weight = torch.empty(d_num, 2 * n_freqs, d_emb)
+        nn.init.normal_(weight, std=0.02)
+        self.weight = nn.Parameter(weight)
+        self.bias = nn.Parameter(torch.zeros(d_num, d_emb))
+
+    @property
+    def d_out(self) -> int:
+        return self.d_num * self.d_emb
+
+    def forward(self, X_num: torch.Tensor) -> torch.Tensor:
+        if X_num.numel() == 0:
+            return torch.empty(X_num.shape[0], 0, device=X_num.device)
+        # X_num: (N, d_num). Compute periodic features for each scalar.
+        phase = 2.0 * math.pi * X_num.unsqueeze(-1) * self.freqs  # (N, d_num, K)
+        embed = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)  # (N, d_num, 2K)
+        # Per-feature linear + ReLU, vectorised via bmm:
+        # embed:  (N, d_num, 2K) → permute to (d_num, N, 2K)
+        # weight: (d_num, 2K, d_emb)
+        # bmm:    (d_num, N, d_emb) → permute to (N, d_num, d_emb)
+        embed = embed.permute(1, 0, 2)  # (d_num, N, 2K)
+        h = torch.bmm(embed, self.weight) + self.bias.unsqueeze(1)  # (d_num, N, d_emb)
+        h = F.relu(h)
+        return h.permute(1, 0, 2).reshape(X_num.shape[0], self.d_num * self.d_emb)
+
+
 class _Preprocessor(nn.Module):
     """Converts raw rows to a continuous, fixed-width tensor for the adapter.
 
     - Numeric columns: median-imputed, standard-scaled (stats fit on train).
+      Optionally further passed through PLR (periodic-linear-ReLU) embeddings.
     - Categorical columns: encoded according to ``cat_encoder``.
 
-    The output dimension ``d_in`` depends on the categorical encoding choice,
-    and is computed in ``fit``.
+    The output dimension ``d_in`` depends on the categorical and numeric
+    encoding choices and is computed in ``fit``.
     """
 
     def __init__(
@@ -201,21 +266,33 @@ class _Preprocessor(nn.Module):
         cat_encoder: str = "embedding",
         cat_embed_dim: object = "auto",
         onehot_max_card: int = 8,
+        num_encoder: str = "standard",
+        plr_freqs: int = 24,
+        plr_emb_dim: int = 8,
+        plr_sigma: float = 1.0,
     ):
         super().__init__()
         if cat_encoder not in {"ordinal", "onehot", "embedding", "mixed"}:
             raise ValueError(
                 f"cat_encoder must be one of ordinal/onehot/embedding/mixed, got {cat_encoder!r}"
             )
+        if num_encoder not in {"standard", "plr"}:
+            raise ValueError(
+                f"num_encoder must be 'standard' or 'plr', got {num_encoder!r}"
+            )
         self.cat_encoder = cat_encoder
         self.cat_embed_dim = cat_embed_dim
         self.onehot_max_card = onehot_max_card
+        self.num_encoder = num_encoder
+        self.plr_freqs = plr_freqs
+        self.plr_emb_dim = plr_emb_dim
+        self.plr_sigma = plr_sigma
 
     @staticmethod
     def _default_embed_dim(cardinality: int) -> int:
         return max(2, min(50, (cardinality + 1) // 2))
 
-    def fit(self, X: np.ndarray, cat_idx: list[int]):
+    def fit(self, X: np.ndarray, cat_idx: list[int], max_d: int = 500):
         n, d_raw = X.shape
         self.cat_idx_ = list(cat_idx)
         self.num_idx_ = [i for i in range(d_raw) if i not in self.cat_idx_]
@@ -225,9 +302,26 @@ class _Preprocessor(nn.Module):
             X_num = X[:, self.num_idx_].astype(np.float64)
             self.num_imputer_ = SimpleImputer(strategy="median").fit(X_num)
             self.num_scaler_ = StandardScaler().fit(self.num_imputer_.transform(X_num))
+            # Optional PLR encoder on top
+            if self.num_encoder == "plr":
+                # Auto-pick d_emb so total numeric output stays ≤ max_d.
+                # PLR expansion = d_num × d_emb; leave headroom for cat width.
+                if self.plr_emb_dim == "auto":
+                    d_emb = max(2, min(16, max_d // max(1, len(self.num_idx_))))
+                else:
+                    d_emb = int(self.plr_emb_dim)
+                self.plr_ = _PLREncoder(
+                    d_num=len(self.num_idx_),
+                    n_freqs=self.plr_freqs,
+                    d_emb=d_emb,
+                    sigma=self.plr_sigma,
+                )
+            else:
+                self.plr_ = None
         else:
             self.num_imputer_ = None
             self.num_scaler_ = None
+            self.plr_ = None
 
         # Categorical: build per-column label encoders to map values → int IDs
         # (unknown category at predict time → mapped to an "unknown" index)
@@ -269,7 +363,11 @@ class _Preprocessor(nn.Module):
         self.cat_widths_ = cat_widths
         self.unknown_ids_ = [card - 1 for card in self.cat_cards_]
 
-        d_num = len(self.num_idx_)
+        d_num_raw = len(self.num_idx_)
+        if self.plr_ is not None:
+            d_num = self.plr_.d_out  # = d_num_raw × plr_emb_dim
+        else:
+            d_num = d_num_raw
         d_cat = sum(self.cat_widths_)
         self.d_out_ = d_num + d_cat
         return self
@@ -299,14 +397,23 @@ class _Preprocessor(nn.Module):
     def forward(self, X_num: torch.Tensor, cat_ids: list[torch.Tensor]) -> torch.Tensor:
         """Build the full continuous representation as a differentiable tensor.
 
-        Numeric block is non-trainable (stats fit ahead of time). Categorical
-        embeddings are trainable nn.Parameters (only when cat_encoder='embedding').
-        One-hot / ordinal paths have no parameters.
+        Numeric block: standardized features (non-trainable scaler stats) optionally
+        passed through trainable PLR embeddings. Categorical embeddings are
+        trainable when cat_encoder='embedding'; one-hot / ordinal paths have no
+        parameters.
         """
         device = X_num.device if X_num.numel() else (cat_ids[0].device if cat_ids else None)
         if device is None:
             raise ValueError("Empty input to preprocessor.")
-        parts = [X_num.to(device)] if X_num.numel() else []
+        if X_num.numel():
+            X_num = X_num.to(device)
+            if self.plr_ is not None:
+                X_num_out = self.plr_(X_num)
+            else:
+                X_num_out = X_num
+            parts = [X_num_out]
+        else:
+            parts = []
 
         for k, ids in enumerate(cat_ids):
             ids = ids.to(device)
@@ -430,6 +537,7 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
         low_rank_ratio: Optional[float] = 0.25,
         hidden_dim: Optional[int] = None,
         use_batch_norm: bool = True,
+        norm_type: str = "batch",
         activation: Optional[str] = None,
         alpha_init: float = 0.02,
         alpha_shape: str = "per-channel",
@@ -438,6 +546,11 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
         cat_encoder: str = "embedding",
         cat_embed_dim: object = "auto",
         onehot_max_card: int = 8,
+        # numeric
+        num_encoder: str = "standard",
+        plr_freqs: int = 24,
+        plr_emb_dim: int = 8,
+        plr_sigma: float = 1.0,
         # optimization
         lr: float = 5e-3,
         weight_decay: float = 3e-3,
@@ -464,6 +577,7 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
         self.low_rank_ratio = low_rank_ratio
         self.hidden_dim = hidden_dim
         self.use_batch_norm = use_batch_norm
+        self.norm_type = norm_type
         self.activation = activation
         self.alpha_init = alpha_init
         self.alpha_shape = alpha_shape
@@ -471,6 +585,10 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
         self.cat_encoder = cat_encoder
         self.cat_embed_dim = cat_embed_dim
         self.onehot_max_card = onehot_max_card
+        self.num_encoder = num_encoder
+        self.plr_freqs = plr_freqs
+        self.plr_emb_dim = plr_emb_dim
+        self.plr_sigma = plr_sigma
         self.lr = lr
         self.weight_decay = weight_decay
         self.gate_lr_factor = gate_lr_factor
@@ -528,7 +646,11 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
             cat_encoder=self.cat_encoder,
             cat_embed_dim=self.cat_embed_dim,
             onehot_max_card=self.onehot_max_card,
-        ).fit(X_np, cat_idx)
+            num_encoder=self.num_encoder,
+            plr_freqs=self.plr_freqs,
+            plr_emb_dim=self.plr_emb_dim,
+            plr_sigma=self.plr_sigma,
+        ).fit(X_np, cat_idx, max_d=self.max_d)
 
         # train / guard split
         if X_val is not None and y_val is not None:
@@ -568,6 +690,7 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
                 low_rank_ratio=self.low_rank_ratio,
                 activation=self.activation,
                 use_batch_norm=self.use_batch_norm,
+                norm_type=self.norm_type,
             )
         elif self.block_type == "mlp":
             block = ResMLPBlock(
@@ -575,6 +698,7 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
                 low_rank_ratio=self.low_rank_ratio,
                 activation=self.activation if self.activation is not None else "relu",
                 use_batch_norm=self.use_batch_norm,
+                norm_type=self.norm_type,
             )
         else:
             raise ValueError(f"block_type must be 'cross' or 'mlp', got {self.block_type!r}")
@@ -644,10 +768,21 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
         # via TabICL.predict_differentiable conditioned on C.
 
         # Resolve max_context. Paper Appendix G caps at 15k–60k; for L40S
-        # safety we default to 6k.
+        # (44GB) safety we scale a target memory budget against the adapter
+        # output width d_back. With d_back=d_in (no projection) memory grows
+        # ~linearly with n_context × d_back × num_layers, plus a fixed Adam
+        # state cost from the adapter params. Empirically 6k×500 ≈ OOM
+        # without head-room for the BatchEnsemble path (which holds K copies).
         n_train = X_tr_num.shape[0] if X_tr_num.numel() else len(y_tr_t)
         if self.max_context == "auto":
-            max_ctx = min(n_train - 1, 6000)
+            # Soft budget. TabICL's row-attention is O(N²·d) per layer with ~6
+            # attention layers in the ICL transformer plus the diff-forward
+            # backward pass holding activations. Empirical L40S 44GB headroom:
+            # n_context × d_back × n_query  ≲  600M ⇒ at n_query≈1k that's
+            # n_context × d_back ≲ 600k. Plus PLR expansion increases d_back;
+            # bagged path multiplies the memory cost across K members.
+            cap = max(300, int(600_000 / max(1, d_back)))
+            max_ctx = min(n_train - 1, cap, 6000)
         elif self.max_context is None:
             max_ctx = n_train - 1
         else:
@@ -1007,3 +1142,143 @@ def _resolve_device(device):
     if isinstance(device, str):
         return torch.device(device)
     return device
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BatchEnsemble: K independently-seeded Retouche adapters per AG bag-fold
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _offload_to_cpu(m: "RetoucheTabICLClassifier") -> None:
+    """Move a fitted Retouche member's GPU state to CPU to free memory."""
+    if hasattr(m, "adapter_"):
+        m.adapter_.cpu()
+    if hasattr(m, "preproc_"):
+        m.preproc_.cpu()
+    if hasattr(m, "_proj_") and m._proj_ is not None:
+        m._proj_ = m._proj_.cpu()
+    # Backbone (TabICL): both diff path and raw path can hold GPU weights.
+    if hasattr(m, "clf_") and getattr(m.clf_, "model_", None) is not None:
+        try:
+            m.clf_.model_.cpu()
+        except Exception:
+            pass
+        # Drop diff-input train cache (the big GPU tensors from
+        # fit_with_differentiable_input)
+        for attr in ("X_train_", "y_train_", "diff_mean_", "diff_std_"):
+            if hasattr(m.clf_, attr):
+                try:
+                    setattr(m.clf_, attr, getattr(m.clf_, attr).detach().cpu())
+                except Exception:
+                    pass
+    if hasattr(m, "_raw_clf_") and m._raw_clf_ is not None and getattr(m._raw_clf_, "model_", None) is not None:
+        try:
+            m._raw_clf_.model_.cpu()
+        except Exception:
+            pass
+    # Cached refit tensor on the wrapper
+    if hasattr(m, "_train_y_full_t_") and m._train_y_full_t_ is not None:
+        try:
+            m._train_y_full_t_ = m._train_y_full_t_.detach().cpu()
+        except Exception:
+            pass
+
+
+def _restore_to_device(m: "RetoucheTabICLClassifier") -> None:
+    """Move a previously offloaded member back to its original device."""
+    dev = getattr(m, "device_", None)
+    if dev is None:
+        return
+    if hasattr(m, "adapter_"):
+        m.adapter_.to(dev)
+    if hasattr(m, "preproc_"):
+        m.preproc_.to(dev)
+    if hasattr(m, "_proj_") and m._proj_ is not None:
+        m._proj_ = m._proj_.to(dev)
+    if hasattr(m, "clf_") and getattr(m.clf_, "model_", None) is not None:
+        try:
+            m.clf_.model_.to(dev)
+        except Exception:
+            pass
+        for attr in ("X_train_", "y_train_", "diff_mean_", "diff_std_"):
+            if hasattr(m.clf_, attr):
+                try:
+                    setattr(m.clf_, attr, getattr(m.clf_, attr).to(dev))
+                except Exception:
+                    pass
+    if hasattr(m, "_raw_clf_") and m._raw_clf_ is not None and getattr(m._raw_clf_, "model_", None) is not None:
+        try:
+            m._raw_clf_.model_.to(dev)
+        except Exception:
+            pass
+    if hasattr(m, "_train_y_full_t_") and m._train_y_full_t_ is not None:
+        try:
+            m._train_y_full_t_ = m._train_y_full_t_.to(dev)
+        except Exception:
+            pass
+
+
+class BaggedRetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
+    """K independently-seeded RetoucheTabICLClassifier adapters, prediction
+    averaged across them.
+
+    Paper Appendix F suggests "BETA-style bagging of the trained adapter at
+    inference to further damp prediction variance." This is the cheap version:
+    K full Retouche fits with seeds (random_state, random_state+1, ...) and
+    inference-time averaging of class probabilities.
+
+    The frozen backbone weights are shared across all K (they don't depend on
+    the seed); only the adapter+preproc parameters are independent. The
+    identity guard runs *per-member*; each member can independently fall back
+    to raw.
+
+    Parameters
+    ----------
+    n_estimators : int, default=4
+        Number of independent adapters to fit and average.
+    **kwargs :
+        Forwarded to each RetoucheTabICLClassifier instance.
+    """
+
+    def __init__(self, n_estimators: int = 4, **kwargs):
+        self.n_estimators = n_estimators
+        self.kwargs = kwargs
+
+    def fit(self, X, y, X_val=None, y_val=None):
+        base_seed = self.kwargs.get("random_state", 42) or 42
+        self.members_ = []
+        for k in range(self.n_estimators):
+            seed = base_seed + 1000 * k
+            kw = dict(self.kwargs)
+            kw["random_state"] = seed
+            m = RetoucheTabICLClassifier(**kw)
+            m.fit(X, y, X_val=X_val, y_val=y_val)
+            # Offload backbones+state to CPU to free GPU between members
+            # (the next member's fit reallocates a fresh TabICL on GPU).
+            _offload_to_cpu(m)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.members_.append(m)
+        self.classes_ = self.members_[0].classes_
+        self.n_classes_ = self.members_[0].n_classes_
+        self.label_encoder_ = self.members_[0].label_encoder_
+        # Ensure outer AG fold-holder receives a CPU-resident bagged model.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            import gc; gc.collect()
+            torch.cuda.empty_cache()
+        return self
+
+    def predict_proba(self, X):
+        probs = []
+        for m in self.members_:
+            _restore_to_device(m)
+            probs.append(m.predict_proba(X))
+            _offload_to_cpu(m)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return np.mean(np.stack(probs, axis=0), axis=0)
+
+    def predict(self, X):
+        idx = np.argmax(self.predict_proba(X), axis=1)
+        return self.label_encoder_.inverse_transform(idx)
