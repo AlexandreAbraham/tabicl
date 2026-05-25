@@ -203,32 +203,258 @@ class GatedAdapter(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class _PLREncoder(nn.Module):
-    """Periodic-Linear-ReLU embedding (Gorishniy et al. 2023).
+class _NAMMixerEncoder(nn.Module):
+    """NAM + Mixer numeric encoder (QuantumBind-style, numerics-only).
 
-    For each scalar feature x_i (shape (N,)), produces an embedding of size
-    ``d_emb`` via:  sin/cos(2π · c · x_i) (with K learnable frequencies) →
-    Linear(2K → d_emb) → ReLU.
+    Per-feature MLP (NAM): each numeric column gets its own small MLP that
+    expands the scalar to ``n_channels`` dims. Then a dense mixer projects
+    the concatenated per-feature embeddings down to ``d_out``, learnable.
 
-    Shared frequencies across features (the simpler 'P' variant); the linear
-    layer is per-feature. Output shape: (N, d_num × d_emb).
+    Architecture per QB v3 / BEST_CONFIG:
+       Linear(1, H) → ReLU → [Linear(H, H) → ReLU]^(L-1) → Linear(H, n_channels)
+       per feature, then Linear(d_num × n_channels, d_out) → ReLU → Dropout.
+
+    Input  (N, d_num) → Output (N, d_out).
     """
 
-    def __init__(self, d_num: int, n_freqs: int = 24, d_emb: int = 8,
-                 sigma: float = 1.0):
+    def __init__(self, d_num: int, hidden: int = 32, n_channels: int = 32,
+                 feat_layers: int = 2, d_out: int = 64, dropout: float = 0.2):
         super().__init__()
         self.d_num = d_num
-        self.n_freqs = n_freqs
+        self.hidden = hidden
+        self.n_channels = n_channels
+        self.feat_layers = feat_layers
+        self._d_out = d_out
+        # Per-feature NAM stack: one Sequential per column, sharing the same
+        # depth/width but independent parameters.
+        def _make_mlp():
+            layers = [nn.Linear(1, hidden), nn.ReLU()]
+            for _ in range(feat_layers - 1):
+                layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+            layers.append(nn.Linear(hidden, n_channels))
+            return nn.Sequential(*layers)
+        self.num_mlps = nn.ModuleList([_make_mlp() for _ in range(d_num)])
+        # Mixer collapses (d_num × n_channels) → d_out.
+        self.mix = nn.Linear(d_num * n_channels, d_out)
+        nn.init.normal_(self.mix.weight, std=0.02)
+        nn.init.zeros_(self.mix.bias)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    @property
+    def d_out(self) -> int:
+        return self._d_out
+
+    def forward(self, X_num: torch.Tensor) -> torch.Tensor:
+        if X_num.numel() == 0:
+            return torch.empty(X_num.shape[0], 0, device=X_num.device)
+        # Per-column independent MLP
+        parts = [self.num_mlps[j](X_num[:, j:j+1]) for j in range(self.d_num)]
+        h = torch.cat(parts, dim=1)  # (N, d_num × n_channels)
+        h = self.mix(h)
+        h = F.relu(h)
+        return self.dropout(h)
+
+
+class _UnifiedNAMEncoder(nn.Module):
+    """Unified NAM-style preprocessor: per-feature embedding for numerics AND
+    categoricals, with optional ``n_slots`` independent embeddings per feature
+    (Cabin-style). A single dense mixer collapses everything to ``d_out``.
+
+    Per feature × per slot:
+      Numerics:    Linear(1,H) → ReLU → ... → Linear(H, n_channels)
+      Categoricals: Embedding(card, emb) → Linear(emb, n_channels)
+
+    With n_slots > 1 each feature contributes ``n_slots`` independent views
+    that get concatenated before the mixer. Input dim grows ×n_slots; output
+    dim is ``d_out`` (unchanged).
+
+    Input  (N, d_num) numerics tensor + list of (N,) cat ID tensors.
+    Output (N, d_out).
+    """
+
+    def __init__(self, d_num: int, cat_cardinalities: list[int],
+                 hidden: int = 32, n_channels: int = 32, feat_layers: int = 2,
+                 cat_emb_dim: int = 16, d_out: int = 64, dropout: float = 0.2,
+                 n_slots: int = 1):
+        super().__init__()
+        self.d_num = d_num
+        self.n_cat = len(cat_cardinalities)
+        self.hidden = hidden
+        self.n_channels = n_channels
+        self.n_slots = n_slots
+        self._d_out = d_out
+        # Numeric per-feature MLPs (n_slots independent ones per feature).
+        # Layout: num_mlps[j * n_slots + s] is feature j, slot s.
+        def _make_num_mlp():
+            layers = [nn.Linear(1, hidden), nn.ReLU()]
+            for _ in range(feat_layers - 1):
+                layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+            layers.append(nn.Linear(hidden, n_channels))
+            return nn.Sequential(*layers)
+        self.num_mlps = nn.ModuleList(
+            [_make_num_mlp() for _ in range(d_num * n_slots)]
+        )
+        # Categorical: embedding + projector to n_channels (n_slots per cat).
+        # Layout: cat_embs[k * n_slots + s] / cat_projs[k * n_slots + s].
+        self.cat_embs = nn.ModuleList()
+        self.cat_projs = nn.ModuleList()
+        for card in cat_cardinalities:
+            actual_emb = max(2, min(cat_emb_dim, int(math.sqrt(card)) + 1))
+            for _ in range(n_slots):
+                emb = nn.Embedding(card, actual_emb)
+                nn.init.normal_(emb.weight, std=0.05)
+                self.cat_embs.append(emb)
+                self.cat_projs.append(nn.Linear(actual_emb, n_channels))
+        # Mixer: (d_num + n_cat) × n_slots × n_channels → d_out
+        d_feat = (d_num + self.n_cat) * n_slots
+        self.mix = nn.Linear(d_feat * n_channels, d_out)
+        nn.init.normal_(self.mix.weight, std=0.02)
+        nn.init.zeros_(self.mix.bias)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    @property
+    def d_out(self) -> int:
+        return self._d_out
+
+    def forward(self, X_num: torch.Tensor,
+                cat_ids: list[torch.Tensor]) -> torch.Tensor:
+        parts = []
+        if self.d_num and X_num.numel():
+            for j in range(self.d_num):
+                for s in range(self.n_slots):
+                    parts.append(self.num_mlps[j * self.n_slots + s](X_num[:, j:j+1]))
+        for k, ids in enumerate(cat_ids):
+            base = k * self.n_slots
+            ids = ids.to(self.cat_embs[base].weight.device)
+            for s in range(self.n_slots):
+                emb = self.cat_embs[base + s](ids)
+                parts.append(self.cat_projs[base + s](emb))
+        if not parts:
+            raise ValueError("UnifiedNAMEncoder got no features.")
+        h = torch.cat(parts, dim=1)  # (N, d_feat × n_slots × n_channels)
+        h = self.mix(h)
+        h = F.relu(h)
+        return self.dropout(h)
+
+
+class _UnifiedRTDLEncoder(nn.Module):
+    """RTDL Periodic embedding + entity embedding + mixer.
+
+    Numerics:    PeriodicEmbeddings(d_num, d_emb)  → (N, d_num, d_emb)
+    Categoricals: Embedding(card_j, emb_j) → Linear(emb_j, d_emb)  → (N, d_emb)
+
+    Stack: (N, d_total, d_emb) where d_total = d_num + n_cat.
+    Mixer: Linear(d_total × d_emb, d_out) → ReLU → Dropout.
+
+    Mirrors _UnifiedNAMEncoder but uses RTDL's periodic embedding for the
+    per-feature numeric step.
+
+    Input  (N, d_num) numerics tensor + list of (N,) cat ID tensors.
+    Output (N, d_out).
+    """
+
+    def __init__(self, d_num: int, cat_cardinalities: list[int],
+                 d_emb: int = 24, n_freqs: int = 48, sigma: float = 0.01,
+                 lite: bool = False, cat_emb_dim: int = 16,
+                 d_out: int = 64, dropout: float = 0.2):
+        super().__init__()
+        try:
+            from rtdl_num_embeddings import PeriodicEmbeddings
+        except ImportError as e:
+            raise ImportError(
+                "RTDL preproc requires `rtdl_num_embeddings`: "
+                "pip install rtdl_num_embeddings"
+            ) from e
+        self.d_num = d_num
+        self.n_cat = len(cat_cardinalities)
         self.d_emb = d_emb
-        # Learnable frequencies, init from N(0, sigma)
-        self.freqs = nn.Parameter(torch.randn(n_freqs) * sigma)
-        # Per-feature linear: each numeric column gets its own 2K → d_emb.
-        # Implemented as a packed (d_num, 2K, d_emb) tensor so we can do a
-        # single bmm instead of a Python loop.
-        weight = torch.empty(d_num, 2 * n_freqs, d_emb)
-        nn.init.normal_(weight, std=0.02)
-        self.weight = nn.Parameter(weight)
-        self.bias = nn.Parameter(torch.zeros(d_num, d_emb))
+        self._d_out = d_out
+        # Numeric: RTDL periodic embeddings
+        if d_num:
+            self.num_emb = PeriodicEmbeddings(
+                n_features=d_num,
+                d_embedding=d_emb,
+                n_frequencies=n_freqs,
+                frequency_init_scale=sigma,
+                activation=True,
+                lite=lite,
+            )
+        else:
+            self.num_emb = None
+        # Categorical: embed + project to d_emb so it stacks with numeric tokens
+        self.cat_embs = nn.ModuleList()
+        self.cat_projs = nn.ModuleList()
+        for card in cat_cardinalities:
+            actual_emb = max(2, min(cat_emb_dim, int(math.sqrt(card)) + 1))
+            self.cat_embs.append(nn.Embedding(card, actual_emb))
+            nn.init.normal_(self.cat_embs[-1].weight, std=0.05)
+            self.cat_projs.append(nn.Linear(actual_emb, d_emb))
+        # Mixer: (d_num + n_cat) × d_emb → d_out
+        d_feat = d_num + self.n_cat
+        self.mix = nn.Linear(d_feat * d_emb, d_out)
+        nn.init.normal_(self.mix.weight, std=0.02)
+        nn.init.zeros_(self.mix.bias)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    @property
+    def d_out(self) -> int:
+        return self._d_out
+
+    def forward(self, X_num: torch.Tensor,
+                cat_ids: list[torch.Tensor]) -> torch.Tensor:
+        device = (self.mix.weight.device if X_num.numel() == 0 else X_num.device)
+        parts = []
+        if self.d_num and X_num.numel():
+            num_out = self.num_emb(X_num)  # (N, d_num, d_emb)
+            parts.append(num_out.reshape(X_num.shape[0], self.d_num * self.d_emb))
+        for k, ids in enumerate(cat_ids):
+            ids = ids.to(device)
+            emb = self.cat_embs[k](ids)               # (N, actual_emb)
+            parts.append(self.cat_projs[k](emb))      # (N, d_emb)
+        if not parts:
+            raise ValueError("UnifiedRTDLEncoder got no features.")
+        # Need (N, (d_num + n_cat) * d_emb); cat parts are (N, d_emb), already flat
+        h = torch.cat(parts, dim=1)
+        h = self.mix(h)
+        h = F.relu(h)
+        return self.dropout(h)
+
+
+class _PLREncoder(nn.Module):
+    """Periodic-Linear-ReLU embedding for numeric features.
+
+    Thin wrapper around Yandex's ``rtdl_num_embeddings.PeriodicEmbeddings``
+    (Gorishniy et al. 2023, "On Embeddings for Numerical Features in Tabular
+    Deep Learning"). The official package provides per-feature frequencies
+    + tuned defaults (``frequency_init_scale=0.01``); we just flatten the
+    last two dims so the rest of the Retouche pipeline can treat numerics
+    as a flat tensor.
+
+    Input  (N, d_num) → Output (N, d_num × d_emb).
+    """
+
+    def __init__(self, d_num: int, n_freqs: int = 48, d_emb: int = 24,
+                 sigma: float = 0.01, lite: bool = False):
+        super().__init__()
+        try:
+            from rtdl_num_embeddings import PeriodicEmbeddings
+        except ImportError as e:
+            raise ImportError(
+                "PLR numeric encoder requires the `rtdl_num_embeddings` package: "
+                "pip install rtdl_num_embeddings"
+            ) from e
+        self.d_num = d_num
+        self.d_emb = d_emb
+        self.n_freqs = n_freqs
+        self.sigma = sigma
+        self.emb = PeriodicEmbeddings(
+            n_features=d_num,
+            d_embedding=d_emb,
+            n_frequencies=n_freqs,
+            frequency_init_scale=sigma,
+            activation=True,  # the "R" (ReLU) in PLR
+            lite=lite,
+        )
 
     @property
     def d_out(self) -> int:
@@ -237,17 +463,8 @@ class _PLREncoder(nn.Module):
     def forward(self, X_num: torch.Tensor) -> torch.Tensor:
         if X_num.numel() == 0:
             return torch.empty(X_num.shape[0], 0, device=X_num.device)
-        # X_num: (N, d_num). Compute periodic features for each scalar.
-        phase = 2.0 * math.pi * X_num.unsqueeze(-1) * self.freqs  # (N, d_num, K)
-        embed = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)  # (N, d_num, 2K)
-        # Per-feature linear + ReLU, vectorised via bmm:
-        # embed:  (N, d_num, 2K) → permute to (d_num, N, 2K)
-        # weight: (d_num, 2K, d_emb)
-        # bmm:    (d_num, N, d_emb) → permute to (N, d_num, d_emb)
-        embed = embed.permute(1, 0, 2)  # (d_num, N, 2K)
-        h = torch.bmm(embed, self.weight) + self.bias.unsqueeze(1)  # (d_num, N, d_emb)
-        h = F.relu(h)
-        return h.permute(1, 0, 2).reshape(X_num.shape[0], self.d_num * self.d_emb)
+        h = self.emb(X_num)  # (N, d_num, d_emb)
+        return h.reshape(X_num.shape[0], self.d_num * self.d_emb)
 
 
 class _Preprocessor(nn.Module):
@@ -267,18 +484,24 @@ class _Preprocessor(nn.Module):
         cat_embed_dim: object = "auto",
         onehot_max_card: int = 8,
         num_encoder: str = "standard",
-        plr_freqs: int = 24,
-        plr_emb_dim: int = 8,
-        plr_sigma: float = 1.0,
+        plr_freqs: int = 48,
+        plr_emb_dim: object = "auto",
+        plr_sigma: float = 0.01,
+        plr_lite: bool = False,
+        nam_hidden: int = 32,
+        nam_d_out: object = "auto",
+        nam_dropout: float = 0.2,
+        nam_slots: int = 1,
     ):
         super().__init__()
         if cat_encoder not in {"ordinal", "onehot", "embedding", "mixed"}:
             raise ValueError(
                 f"cat_encoder must be one of ordinal/onehot/embedding/mixed, got {cat_encoder!r}"
             )
-        if num_encoder not in {"standard", "plr"}:
+        if num_encoder not in {"standard", "plr", "nam", "unified_nam", "rtdl"}:
             raise ValueError(
-                f"num_encoder must be 'standard' or 'plr', got {num_encoder!r}"
+                f"num_encoder must be 'standard'/'plr'/'nam'/'unified_nam'/'rtdl', "
+                f"got {num_encoder!r}"
             )
         self.cat_encoder = cat_encoder
         self.cat_embed_dim = cat_embed_dim
@@ -287,6 +510,11 @@ class _Preprocessor(nn.Module):
         self.plr_freqs = plr_freqs
         self.plr_emb_dim = plr_emb_dim
         self.plr_sigma = plr_sigma
+        self.plr_lite = plr_lite
+        self.nam_hidden = nam_hidden
+        self.nam_d_out = nam_d_out
+        self.nam_dropout = nam_dropout
+        self.nam_slots = nam_slots
 
     @staticmethod
     def _default_embed_dim(cardinality: int) -> int:
@@ -296,32 +524,47 @@ class _Preprocessor(nn.Module):
         n, d_raw = X.shape
         self.cat_idx_ = list(cat_idx)
         self.num_idx_ = [i for i in range(d_raw) if i not in self.cat_idx_]
+        self.unified_ = self.num_encoder in ("unified_nam", "rtdl")
 
         # Numeric: impute + scale
         if self.num_idx_:
             X_num = X[:, self.num_idx_].astype(np.float64)
             self.num_imputer_ = SimpleImputer(strategy="median").fit(X_num)
             self.num_scaler_ = StandardScaler().fit(self.num_imputer_.transform(X_num))
-            # Optional PLR encoder on top
+            # Optional learnable numeric encoder on top
             if self.num_encoder == "plr":
-                # Auto-pick d_emb so total numeric output stays ≤ max_d.
-                # PLR expansion = d_num × d_emb; leave headroom for cat width.
                 if self.plr_emb_dim == "auto":
-                    d_emb = max(2, min(16, max_d // max(1, len(self.num_idx_))))
+                    d_emb = max(2, min(24, max_d // max(1, len(self.num_idx_))))
                 else:
                     d_emb = int(self.plr_emb_dim)
-                self.plr_ = _PLREncoder(
+                self.num_enc_ = _PLREncoder(
                     d_num=len(self.num_idx_),
                     n_freqs=self.plr_freqs,
                     d_emb=d_emb,
                     sigma=self.plr_sigma,
+                    lite=self.plr_lite,
+                )
+            elif self.num_encoder == "nam":
+                # QuantumBind-style NAM + Mixer: per-feature MLP expands, then
+                # a learnable mixer collapses to d_out. Keeps the post-encoder
+                # width close to original d so TabICL doesn't blow up on the
+                # column-attention step.
+                if self.nam_d_out == "auto":
+                    d_out = max(8, min(128, len(self.num_idx_) * 2))
+                else:
+                    d_out = int(self.nam_d_out)
+                self.num_enc_ = _NAMMixerEncoder(
+                    d_num=len(self.num_idx_),
+                    hidden=self.nam_hidden,
+                    d_out=d_out,
+                    dropout=self.nam_dropout,
                 )
             else:
-                self.plr_ = None
+                self.num_enc_ = None
         else:
             self.num_imputer_ = None
             self.num_scaler_ = None
-            self.plr_ = None
+            self.num_enc_ = None
 
         # Categorical: build per-column label encoders to map values → int IDs
         # (unknown category at predict time → mapped to an "unknown" index)
@@ -363,13 +606,57 @@ class _Preprocessor(nn.Module):
         self.cat_widths_ = cat_widths
         self.unknown_ids_ = [card - 1 for card in self.cat_cards_]
 
-        d_num_raw = len(self.num_idx_)
-        if self.plr_ is not None:
-            d_num = self.plr_.d_out  # = d_num_raw × plr_emb_dim
+        if self.unified_:
+            # Unified mode: a single encoder consumes both numerics and cat IDs
+            # and outputs d_target directly. Overrides the per-modality path.
+            if self.nam_d_out == "auto":
+                # Default to original raw feature count (so TabICL sees the
+                # same C as it would with no preproc) — column-attention cost
+                # stays bounded.
+                d_target = max(8, len(self.num_idx_) + len(self.cat_idx_))
+            else:
+                d_target = int(self.nam_d_out)
+            if self.num_encoder == "unified_nam":
+                self.unified_enc_ = _UnifiedNAMEncoder(
+                    d_num=len(self.num_idx_),
+                    cat_cardinalities=self.cat_cards_,
+                    hidden=self.nam_hidden,
+                    n_channels=self.nam_hidden,
+                    feat_layers=2,
+                    cat_emb_dim=16,
+                    d_out=d_target,
+                    dropout=self.nam_dropout,
+                    n_slots=self.nam_slots,
+                )
+            else:  # "rtdl"
+                # Auto-pick d_emb so that intermediate (d_total × d_emb) is
+                # reasonable: cap at ~512 cells in the mixer's input.
+                d_total = len(self.num_idx_) + len(self.cat_idx_)
+                if self.plr_emb_dim == "auto":
+                    d_emb = max(4, min(24, 512 // max(1, d_total)))
+                else:
+                    d_emb = int(self.plr_emb_dim)
+                self.unified_enc_ = _UnifiedRTDLEncoder(
+                    d_num=len(self.num_idx_),
+                    cat_cardinalities=self.cat_cards_,
+                    d_emb=d_emb,
+                    n_freqs=self.plr_freqs,
+                    sigma=self.plr_sigma,
+                    lite=self.plr_lite,
+                    cat_emb_dim=16,
+                    d_out=d_target,
+                    dropout=self.nam_dropout,
+                )
+            self.d_out_ = d_target
         else:
-            d_num = d_num_raw
-        d_cat = sum(self.cat_widths_)
-        self.d_out_ = d_num + d_cat
+            self.unified_enc_ = None
+            d_num_raw = len(self.num_idx_)
+            if self.num_enc_ is not None:
+                d_num = self.num_enc_.d_out
+            else:
+                d_num = d_num_raw
+            d_cat = sum(self.cat_widths_)
+            self.d_out_ = d_num + d_cat
         return self
 
     def transform_numeric(self, X: np.ndarray) -> torch.Tensor:
@@ -400,15 +687,20 @@ class _Preprocessor(nn.Module):
         Numeric block: standardized features (non-trainable scaler stats) optionally
         passed through trainable PLR embeddings. Categorical embeddings are
         trainable when cat_encoder='embedding'; one-hot / ordinal paths have no
-        parameters.
+        parameters. Unified-NAM mode bypasses both and produces d_target directly.
         """
         device = X_num.device if X_num.numel() else (cat_ids[0].device if cat_ids else None)
         if device is None:
             raise ValueError("Empty input to preprocessor.")
+
+        if self.unified_:
+            # Single encoder consumes both modalities, outputs (N, d_target).
+            return self.unified_enc_(X_num, cat_ids)
+
         if X_num.numel():
             X_num = X_num.to(device)
-            if self.plr_ is not None:
-                X_num_out = self.plr_(X_num)
+            if self.num_enc_ is not None:
+                X_num_out = self.num_enc_(X_num)
             else:
                 X_num_out = X_num
             parts = [X_num_out]
@@ -548,9 +840,14 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
         onehot_max_card: int = 8,
         # numeric
         num_encoder: str = "standard",
-        plr_freqs: int = 24,
-        plr_emb_dim: int = 8,
-        plr_sigma: float = 1.0,
+        plr_freqs: int = 48,
+        plr_emb_dim: object = "auto",
+        plr_sigma: float = 0.01,
+        plr_lite: bool = False,
+        nam_hidden: int = 32,
+        nam_d_out: object = "auto",
+        nam_dropout: float = 0.2,
+        nam_slots: int = 1,
         # optimization
         lr: float = 5e-3,
         weight_decay: float = 3e-3,
@@ -589,6 +886,11 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
         self.plr_freqs = plr_freqs
         self.plr_emb_dim = plr_emb_dim
         self.plr_sigma = plr_sigma
+        self.plr_lite = plr_lite
+        self.nam_hidden = nam_hidden
+        self.nam_d_out = nam_d_out
+        self.nam_dropout = nam_dropout
+        self.nam_slots = nam_slots
         self.lr = lr
         self.weight_decay = weight_decay
         self.gate_lr_factor = gate_lr_factor
@@ -650,6 +952,11 @@ class RetoucheTabICLClassifier(BaseEstimator, ClassifierMixin):
             plr_freqs=self.plr_freqs,
             plr_emb_dim=self.plr_emb_dim,
             plr_sigma=self.plr_sigma,
+            plr_lite=self.plr_lite,
+            nam_hidden=self.nam_hidden,
+            nam_d_out=self.nam_d_out,
+            nam_dropout=self.nam_dropout,
+            nam_slots=self.nam_slots,
         ).fit(X_np, cat_idx, max_d=self.max_d)
 
         # train / guard split
