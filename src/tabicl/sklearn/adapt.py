@@ -664,13 +664,31 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
         """Apply requires_grad flags based on the freeze set."""
         self._frozen_ = frozen
 
-        # Make sure the backbone TabICL model is loaded (lazy on the diff clf).
-        if getattr(self._diff_clf_, "model_", None) is None:
-            self._diff_clf_._load_model()
-            self._diff_clf_.model_.to(self.device_)
-            # Diff classifier expects the model in train mode with frozen
-            # weights; we manage requires_grad below.
-            self._diff_clf_.model_.train()
+        # Make sure the backbone is loaded AND the diff classifier has been
+        # primed via its "first call" branch in fit_with_differentiable_input.
+        # That branch unconditionally sets every backbone param's requires_grad
+        # to False — we have to let it run *before* applying our own freeze
+        # flags, otherwise the user's freeze="none" gets silently overwritten
+        # on the first forward call.
+        if getattr(self._diff_clf_, "diff_mean_", None) is None:
+            # First-time priming with a tiny dummy batch. Two rows are enough.
+            d = self._d_in_
+            dummy_X = torch.zeros(2, d, device=self.device_,
+                                   dtype=torch.float32, requires_grad=False)
+            dummy_y = torch.tensor([0, 1], device=self.device_, dtype=torch.long)
+            self._diff_clf_.fit_with_differentiable_input(dummy_X, dummy_y)
+            # The diff classifier just set requires_grad=False on all backbone
+            # params and set diff_mean_/std_ from the dummy batch. We'll fix
+            # both below: requires_grad here, diff_mean_/std_ on the next
+            # *real* fit_with_differentiable_input call inside training.
+            # Force diff_mean_/std_ back to "uninitialized" so the next real
+            # call recomputes them from real data. The diff classifier uses
+            # `hasattr(self, "diff_mean_")` to detect the first call, so we
+            # have to delete (not None-set) the attributes.
+            for attr in ("diff_mean_", "diff_std_"):
+                if hasattr(self._diff_clf_, attr):
+                    delattr(self._diff_clf_, attr)
+
         # If noise adapter is requested, build the modules now.
         if self.use_noise_adapter:
             self._build_noise_modules()
@@ -903,7 +921,7 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
                     y_es = torch.from_numpy(y_train_np[es_idx]).long().to(device)
                     es_logits = self._diff_classifier_forward(x_pool, y_pool, x_es)
                     es_loss = float(F.cross_entropy(es_logits, y_es).item())
-                if self.verbose and epoch % 5 == 0:
+                if self.verbose:
                     print(f"[adapt {mode}] ep {epoch:3d}  q_loss={loss.item():.4f}  es_loss={es_loss:.4f}",
                           flush=True)
                 if es_loss + 1e-6 < best_loss:
@@ -1003,18 +1021,26 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
             self._restore_state(best_state)
 
     def _set_train_mode(self, training: bool):
-        """Set train/eval mode on trainable modules, respecting freezes."""
+        """Set train/eval mode on trainable modules, respecting freezes.
+
+        Important: the TabICL backbone submodules stay in train mode at all
+        times during training/eval. Putting them in eval mode would route their
+        forward through ``_inference_forward``, which contains internal
+        ``torch.no_grad()`` blocks (see ``model/inference.py``) — that
+        permanently detaches gradient and breaks fine-tuning on the next
+        iteration. Whether the backbone trains is controlled by
+        ``requires_grad`` (set in ``_apply_freezing``), not by ``.train()``
+        / ``.eval()``. Only the NAM2a / noise-adapter modules are toggled by
+        this method, since their forward path doesn't have inference-only
+        branches.
+        """
         if self._nam_ is not None:
             self._nam_.train(training and "nam" not in self._frozen_)
         if self.use_noise_adapter and self._noise_col_ is not None:
             self._noise_col_.train(training and "noise" not in self._frozen_)
             self._noise_icl_.train(training and "noise" not in self._frozen_)
-        m = self._diff_clf_.model_
-        for sn in ("col_embedder", "row_interactor", "icl_predictor"):
-            mod = getattr(m, sn, None)
-            if mod is None:
-                continue
-            mod.train(training and sn not in self._frozen_)
+        # Backbone: keep in train mode unconditionally. The diff classifier
+        # set model_.train() on its first-call branch; we don't override.
 
     def _snapshot_state(self) -> dict:
         snap = {}
