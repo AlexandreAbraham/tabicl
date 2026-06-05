@@ -7,6 +7,8 @@ from torch import nn, Tensor
 from .embedding import ColEmbedding
 from .interaction import RowInteraction
 from .learning import ICLearning
+from .nam import NAMEncoder
+from .noise_adapter import NoiseFilm
 from .quantile_dist import QuantileToDistribution
 from .kv_cache import TabICLCache
 from .inference_config import InferenceConfig
@@ -188,6 +190,8 @@ class TabICL(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         recompute: bool = False,
+        nam: Optional[NAMEncoder] = None,
+        noise_film: Optional[NoiseFilm] = None,
     ):
         super().__init__()
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
@@ -276,6 +280,11 @@ class TabICL(nn.Module):
             recompute=recompute,
         )
 
+        # Optional learnable adapters. ``None`` means the module is absent and
+        # the forward path is identical to vanilla TabICL.
+        self.nam = nam
+        self.noise_film = noise_film
+
         # KV cache for efficient inference
         self._cache: Optional[TabICLCache] = None
 
@@ -330,16 +339,24 @@ class TabICL(nn.Module):
         if d is not None and len(d.unique()) == 1 and d[0] == H:
             d = None
 
-        # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                y_train=y_train,
-                d=d,
-                embed_with_test=embed_with_test,
-            ),
+        # Optional NAM preprocessing.
+        if self.nam is not None:
+            X = self.nam(X)
+
+        # Column-wise embedding
+        embeddings = self.col_embedder(
+            X,
+            y_train=y_train,
             d=d,
+            embed_with_test=embed_with_test,
         )
+
+        # Optional noise FiLM between col_embedder and row_interactor.
+        if self.noise_film is not None:
+            embeddings = self.noise_film(embeddings)
+
+        # Row-wise interaction
+        representations = self.row_interactor(embeddings, d=d)
 
         # Dataset-wise in-context learning
         return self.icl_predictor(representations, y_train=y_train)
@@ -404,15 +421,26 @@ class TabICL(nn.Module):
         if inference_config is None:
             inference_config = InferenceConfig()
 
-        # Column-wise embedding -> Row-wise interaction
+        # Optional NAM preprocessing.
+        if self.nam is not None:
+            X = self.nam(X)
+
+        # Column-wise embedding
+        embeddings = self.col_embedder(
+            X,
+            y_train=y_train,
+            embed_with_test=embed_with_test,
+            feature_shuffles=feature_shuffles,
+            mgr_config=inference_config.COL_CONFIG,
+        )
+
+        # Optional noise FiLM between col_embedder and row_interactor.
+        if self.noise_film is not None:
+            embeddings = self.noise_film(embeddings)
+
+        # Row-wise interaction
         representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                y_train=y_train,
-                embed_with_test=embed_with_test,
-                feature_shuffles=feature_shuffles,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
+            embeddings,
             mgr_config=inference_config.ROW_CONFIG,
         )
 
