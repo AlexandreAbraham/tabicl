@@ -8,6 +8,7 @@ __all__ = [
     "TabICLUnsupervised",
     "FinetunedTabICLClassifier",
     "FinetunedTabICLRegressor",
+    "AdaptiveFinetunedTabICLClassifier",
     "InferenceConfig",
 ]
 
@@ -28,7 +29,11 @@ def __getattr__(name):
 
         return TabICLUnsupervised
 
-    if name in {"FinetunedTabICLClassifier", "FinetunedTabICLRegressor"}:
+    if name in {
+        "FinetunedTabICLClassifier",
+        "FinetunedTabICLRegressor",
+        "AdaptiveFinetunedTabICLClassifier",
+    }:
         from . import _finetune
 
         return getattr(_finetune, name)
