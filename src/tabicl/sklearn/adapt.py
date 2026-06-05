@@ -466,6 +466,8 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
         label_smoothing: float = 0.15,
         max_grad_norm: float = 1.0,
         sample_weights: Optional[list[float]] = None,
+        meta_batch: int = 1,
+        ema_alpha: float = 0.1,
     ):
         """Continued pre-training on multiple datasets.
 
@@ -509,6 +511,8 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
             max_context=max_context,
             label_smoothing=label_smoothing,
             max_grad_norm=max_grad_norm,
+            meta_batch=meta_batch,
+            ema_alpha=ema_alpha,
         )
         self._is_fitted_ = True
         self._mode_ = "cpt"
@@ -529,14 +533,19 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
         device = self.device_
         # Build train context tensor (with NAM2a preproc if enabled)
         x_tr_back = self._forward_preproc(self._train_X_np_)
-        self._diff_clf_.fit_with_differentiable_input(
-            x_tr_back, torch.from_numpy(self._train_y_enc_).long().to(device),
-        )
+        y_train_t = torch.from_numpy(self._train_y_enc_).long().to(device)
         x_te_back = self._forward_preproc(X_np)
         with torch.no_grad():
-            probs = self._diff_clf_.predict_differentiable(
-                x_te_back, return_logits=False, softmax_temperature=0.9,
-            )
+            if self.use_noise_adapter:
+                # Route through the adapter-aware forward so the noise adapter
+                # weights are actually applied at predict time.
+                logits = self._diff_classifier_forward(x_tr_back, y_train_t, x_te_back)
+                probs = torch.softmax(logits / 0.9, dim=-1)
+            else:
+                self._diff_clf_.fit_with_differentiable_input(x_tr_back, y_train_t)
+                probs = self._diff_clf_.predict_differentiable(
+                    x_te_back, return_logits=False, softmax_temperature=0.9,
+                )
         probs_np = probs.detach().cpu().numpy()
         if not np.all(np.isfinite(probs_np)):
             # Fallback: pristine raw TabICL
@@ -833,19 +842,26 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
         m = self._diff_clf_.model_
         # Stage 1
         embeddings = m.col_embedder(X_combined, y_train=y_train_t, embed_with_test=False)
-        # Inject col-side noise adapter (zero noise → adapter is identity-ish at init)
+        # Inject col-side noise adapter with per-row |y| metadata.
+        # Train rows: |y_normalized| (a row-level "magnitude" signal so the
+        # adapter can learn to gate by support-row decisiveness, e.g. sigma-like).
+        # Test rows: 0 (we don't have y for them at predict time).
         B, T = embeddings.shape[:2]
         G = embeddings.size(-2) - m.row_num_cls
-        noise_meta = torch.zeros(B, T, G, self.noise_dim,
-                                  device=embeddings.device, dtype=embeddings.dtype)
+        n_train = y_train_t.shape[1]
+        # |y - mean| / (std + eps), zero-padded for test rows
+        y_centered = y_train_t - y_train_t.mean(dim=1, keepdim=True)
+        y_norm = y_centered.abs() / (y_centered.std(dim=1, keepdim=True) + 1e-6)
+        row_meta = torch.zeros(B, T, self.noise_dim,
+                                device=embeddings.device, dtype=embeddings.dtype)
+        row_meta[:, :n_train, 0] = y_norm.squeeze(0) if y_norm.dim() == 2 else y_norm
+        # Broadcast row metadata across features (same |y| for all G features per row).
+        noise_meta = row_meta.unsqueeze(2).expand(B, T, G, self.noise_dim).contiguous()
         embeddings = self._noise_col_(embeddings, noise_meta)
         # Stage 2
         representations = m.row_interactor(embeddings)
-        # Inject ICL-side noise adapter
-        noise_summary = torch.zeros(B, T, self.noise_dim,
-                                     device=representations.device,
-                                     dtype=representations.dtype)
-        representations = self._noise_icl_(representations, noise_summary)
+        # Inject ICL-side noise adapter with row metadata too.
+        representations = self._noise_icl_(representations, row_meta)
         # Stage 3
         out = m.icl_predictor(representations, y_train=y_train_t)
         # Slice to actual num classes, like predict_differentiable does
@@ -945,14 +961,16 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
     def _run_training_loop_multi(
         self, *, datasets, mode, rng, weights, lr, backbone_lr_factor,
         weight_decay, epochs, patience, max_context, label_smoothing, max_grad_norm,
+        meta_batch=1, ema_alpha=0.1,
     ):
-        """CPT loop: each epoch sample one dataset, take a single step."""
+        """CPT loop: each step sample meta_batch tasks, accumulate gradients,
+        step once. Early-stop tracks EMA of mean meta-batch loss (smooths over
+        cross-task variance).
+        """
         device = self.device_
         param_groups = self._backbone_param_groups(lr, backbone_lr_factor, weight_decay)
         optimizer = torch.optim.AdamW(param_groups)
 
-        # Re-encode each dataset's labels using a fresh LabelEncoder so they
-        # all match self.classes_ (assumes same class set across datasets).
         encoded = []
         for X_i, y_i in datasets:
             Xi_np = _to_numpy(X_i)
@@ -962,9 +980,9 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
         best_loss = float("inf")
         best_state = None
         bad = 0
+        ema_loss = None
 
-        for epoch in range(epochs):
-            # Sample dataset
+        def _sample_one_task_loss():
             if weights is None:
                 idx = rng.randint(0, len(encoded))
             else:
@@ -972,9 +990,8 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
             X_d, y_d = encoded[idx]
             n_d = len(y_d)
             if n_d < 4:
-                continue
+                return None, idx
 
-            # Resolve per-step max_context for THIS dataset
             if max_context == "auto":
                 max_ctx = min(n_d - 2, max(500, int(600_000 / max(1, self._d_in_))), 6000)
             elif max_context is None:
@@ -988,7 +1005,6 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
             if len(q_local) < 2:
                 q_local = perm[-2:]
 
-            self._set_train_mode(training=True)
             x_ctx = self._forward_preproc(X_d[ctx_local])
             x_q = self._forward_preproc(X_d[q_local])
             y_ctx = torch.from_numpy(y_d[ctx_local]).long().to(device)
@@ -996,25 +1012,44 @@ class TabICLAdaptClassifier(ClassifierMixin, BaseEstimator):
 
             logits = self._diff_classifier_forward(x_ctx, y_ctx, x_q)
             loss = F.cross_entropy(logits, y_q, label_smoothing=label_smoothing)
+            return loss, idx
+
+        for epoch in range(epochs):
+            self._set_train_mode(training=True)
             optimizer.zero_grad()
-            loss.backward()
+            losses = []
+            for _ in range(meta_batch):
+                loss_t, idx = _sample_one_task_loss()
+                if loss_t is None:
+                    continue
+                # Scale so accumulated grad is the MEAN across the meta-batch.
+                (loss_t / max(1, meta_batch)).backward()
+                losses.append(float(loss_t.item()))
+            if not losses:
+                continue
+
             params_for_clip = [p for g in optimizer.param_groups for p in g["params"]]
             torch.nn.utils.clip_grad_norm_(params_for_clip, max_grad_norm)
             optimizer.step()
 
-            # Patience based on running query loss
+            step_loss = float(np.mean(losses))
+            ema_loss = step_loss if ema_loss is None else (1 - ema_alpha) * ema_loss + ema_alpha * step_loss
+
             if self.verbose and epoch % 5 == 0:
-                print(f"[adapt {mode}] ep {epoch:3d} ds {idx}  q_loss={loss.item():.4f}",
+                print(f"[adapt {mode}] ep {epoch:3d} mb={len(losses)}  "
+                      f"step_loss={step_loss:.4f}  ema={ema_loss:.4f}",
                       flush=True)
-            if loss.item() + 1e-6 < best_loss:
-                best_loss = loss.item()
+
+            if ema_loss + 1e-6 < best_loss:
+                best_loss = ema_loss
                 best_state = self._snapshot_state()
                 bad = 0
             else:
                 bad += 1
                 if bad >= patience:
                     if self.verbose:
-                        print(f"[adapt {mode}] early stop @ epoch {epoch}", flush=True)
+                        print(f"[adapt {mode}] early stop @ epoch {epoch} "
+                              f"(best_ema={best_loss:.4f})", flush=True)
                     break
 
         if best_state is not None:
