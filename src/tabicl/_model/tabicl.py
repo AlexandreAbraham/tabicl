@@ -298,7 +298,12 @@ class TabICL(nn.Module):
         self._cache = None
 
     def _train_forward(
-        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        d: Optional[Tensor] = None,
+        embed_with_test: bool = False,
+        noise: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
@@ -353,7 +358,12 @@ class TabICL(nn.Module):
 
         # Optional noise FiLM between col_embedder and row_interactor.
         if self.noise_film is not None:
-            embeddings = self.noise_film(embeddings)
+            if noise is None:
+                raise ValueError(
+                    "Model has a NoiseFilm adapter; pass per-row noise (B, T) "
+                    "to forward()."
+                )
+            embeddings = self.noise_film(embeddings, noise=noise)
 
         # Row-wise interaction
         representations = self.row_interactor(embeddings, d=d)
@@ -370,6 +380,7 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
+        noise: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -436,7 +447,12 @@ class TabICL(nn.Module):
 
         # Optional noise FiLM between col_embedder and row_interactor.
         if self.noise_film is not None:
-            embeddings = self.noise_film(embeddings)
+            if noise is None:
+                raise ValueError(
+                    "Model has a NoiseFilm adapter; pass per-row noise (B, T) "
+                    "to forward()."
+                )
+            embeddings = self.noise_film(embeddings, noise=noise)
 
         # Row-wise interaction
         representations = self.row_interactor(
@@ -465,6 +481,7 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
+        noise: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -521,7 +538,9 @@ class TabICL(nn.Module):
         """
 
         if self.training:
-            out = self._train_forward(X, y_train, d=d, embed_with_test=embed_with_test)
+            out = self._train_forward(
+                X, y_train, d=d, embed_with_test=embed_with_test, noise=noise,
+            )
         else:
             out = self._inference_forward(
                 X,
@@ -530,6 +549,7 @@ class TabICL(nn.Module):
                 embed_with_test=embed_with_test,
                 return_logits=return_logits,
                 softmax_temperature=softmax_temperature,
+                noise=noise,
                 inference_config=inference_config,
             )
 
