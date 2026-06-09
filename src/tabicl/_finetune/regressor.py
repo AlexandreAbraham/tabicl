@@ -315,7 +315,7 @@ class FinetunedTabICLRegressor(RegressorMixin, FinetunedTabICLBase):
         # (E, test_size, Q). ``d`` is omitted — all ensemble members in a
         # fine-tuning batch share the same feature count, so ``d=None``
         # short-circuits the mask math inside TabICL.
-        quantiles = model(batch.X, batch.y_train)
+        quantiles = model(batch.X, batch.y_train, noise=batch.noise)
         # TabICL's pretrained regressor head uses the default quantile levels
         # ``linspace(0, 1, Q+2)[1:-1]`` (see :class:`QuantileToDistribution`),
         # so we build ``alpha`` on the compute device directly.

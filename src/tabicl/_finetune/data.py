@@ -64,6 +64,10 @@ class MetaBatch:
     train_size: int
     y_scaler_mean: Optional[float] = None
     y_scaler_std: Optional[float] = None
+    # Optional per-row noise signal threaded through to TabICL.NoiseFilm.
+    # Shape (E, T) — same E, T as X. None when the model has no NoiseFilm
+    # adapter attached.
+    noise: Optional[torch.Tensor] = None
 
 
 def count_chunks(
@@ -181,6 +185,7 @@ def _build_meta_batch(
     class_shuffle_method: str,
     outlier_threshold: float,
     preprocessing_seed: int,
+    noise_chunk: Optional[np.ndarray] = None,
 ) -> MetaBatch:
     """Build one MetaBatch from one chunk of the training set.
 
@@ -198,6 +203,11 @@ def _build_meta_batch(
     y_ctx = y_chunk[ctx_idx]
     X_qry = X_chunk[qry_idx]
     y_qry = y_chunk[qry_idx]
+    if noise_chunk is not None:
+        noise_ctx = noise_chunk[ctx_idx]
+        noise_qry = noise_chunk[qry_idx]
+    else:
+        noise_ctx = noise_qry = None
 
     y_mean: Optional[float] = None
     y_std: Optional[float] = None
@@ -251,6 +261,19 @@ def _build_meta_batch(
     y_query_dtype = torch.long if classification else torch.float32
     y_query_tensor = torch.from_numpy(np.stack(y_query_list, axis=0)).to(dtype=y_query_dtype)
 
+    # Build the per-ensemble noise tensor (E, T) by concatenating ctx+qry once
+    # then replicating across ensemble members. Feature shuffles act on the
+    # column axis (H) and so don't touch the per-row noise; class shuffles act
+    # on labels and likewise leave noise alone.
+    if noise_chunk is not None:
+        noise_t = np.concatenate([noise_ctx, noise_qry], axis=0).astype(np.float32)
+        E = X_tensor.shape[0]
+        noise_tensor: Optional[torch.Tensor] = (
+            torch.from_numpy(noise_t).unsqueeze(0).expand(E, -1).contiguous()
+        )
+    else:
+        noise_tensor = None
+
     return MetaBatch(
         X=X_tensor,
         y_train=y_train_tensor,
@@ -258,6 +281,7 @@ def _build_meta_batch(
         train_size=train_size,
         y_scaler_mean=y_mean,
         y_scaler_std=y_std,
+        noise=noise_tensor,
     )
 
 
@@ -278,6 +302,7 @@ def iter_epoch_meta_batches(
     min_chunk_size: int = 50,
     rank: int = 0,
     world_size: int = 1,
+    noise: Optional[np.ndarray] = None,
 ) -> Iterator[MetaBatch]:
     """Yield one :class:`MetaBatch` per chunk of ``(X, y)`` for a single epoch.
 
@@ -309,6 +334,7 @@ def iter_epoch_meta_batches(
     for chunk_idx, indices in sharded:
         X_chunk = X[indices]
         y_chunk = y[indices]
+        noise_chunk = noise[indices] if noise is not None else None
         query_size = max(1, int(len(indices) * query_ratio))
         yield _build_meta_batch(
             X_chunk,
@@ -323,6 +349,7 @@ def iter_epoch_meta_batches(
             class_shuffle_method=class_shuffle_method,
             outlier_threshold=outlier_threshold,
             preprocessing_seed=preprocessing_seed,
+            noise_chunk=noise_chunk,
         )
 
 
@@ -335,4 +362,5 @@ def move_meta_batch(batch: MetaBatch, device: torch.device) -> MetaBatch:
         train_size=batch.train_size,
         y_scaler_mean=batch.y_scaler_mean,
         y_scaler_std=batch.y_scaler_std,
+        noise=batch.noise.to(device, non_blocking=True) if batch.noise is not None else None,
     )

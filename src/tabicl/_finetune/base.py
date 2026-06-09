@@ -384,6 +384,8 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
         X_val=None,
         y_val=None,
         output_dir: Optional[str | Path] = None,
+        noise=None,
+        noise_val=None,
     ) -> "FinetunedTabICLBase":
         """Fine-tune the pretrained TabICL on ``(X, y)``.
 
@@ -625,6 +627,8 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
+        noise_train: Optional[np.ndarray] = None,
+        noise_val: Optional[np.ndarray] = None,
     ) -> ValidationMetrics:
         """Build an inner estimator with current weights and run one validation pass.
 
@@ -636,7 +640,10 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
         inner = self._build_inner_estimator(self.model_, self.n_estimators_validation, device)
         self.model_.eval()
         try:
-            return self._run_validation(inner, X_train, y_train, X_val, y_val)
+            return self._run_validation(
+                inner, X_train, y_train, X_val, y_val,
+                noise_train=noise_train, noise_val=noise_val,
+            )
         finally:
             # Only flip back to train mode if we're still inside a fit loop;
             # ``is_fitted_`` is set after the loop exits.
@@ -712,6 +719,16 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
         )
         self.X_raw_ = X
         self.y_raw_ = y  # original labels; the final estimator re-encodes internally
+        self.noise_raw_ = (
+            np.asarray(noise, dtype=np.float32) if noise is not None else None
+        )
+        if self.noise_raw_ is not None and self.noise_raw_.shape[0] != X.shape[0]:
+            raise ValueError(
+                f"noise has length {self.noise_raw_.shape[0]} but X has {X.shape[0]} rows"
+            )
+        self.noise_val_raw_ = (
+            np.asarray(noise_val, dtype=np.float32) if noise_val is not None else None
+        )
 
         # 3b. Label-encode classification targets. The meta-batch builder uses
         # raw labels as array indices and class counts (see data.py), which
@@ -725,21 +742,35 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
             y_fit = y
 
         # 4. Val split
+        noise_train_arr: Optional[np.ndarray] = None
+        noise_val_arr: Optional[np.ndarray] = None
         if X_val is not None and y_val is not None:
             X_train_arr, y_train_arr = X, y_fit
             X_val_arr = check_array(X_val, ensure_all_finite=False, dtype=None)
             y_val_arr = np.asarray(y_val)
             if self._model_type == "classifier":
                 y_val_arr = self._label_encoder_.transform(y_val_arr).astype(np.int64)
+            noise_train_arr = self.noise_raw_
+            noise_val_arr = self.noise_val_raw_
         else:
             stratify = y_fit if self._model_type == "classifier" else None
-            X_train_arr, X_val_arr, y_train_arr, y_val_arr = train_test_split(
-                X,
-                y_fit,
-                test_size=self.validation_split_ratio,
-                random_state=self.random_state,
-                stratify=stratify,
-            )
+            if self.noise_raw_ is not None:
+                X_train_arr, X_val_arr, y_train_arr, y_val_arr, noise_train_arr, noise_val_arr = train_test_split(
+                    X,
+                    y_fit,
+                    self.noise_raw_,
+                    test_size=self.validation_split_ratio,
+                    random_state=self.random_state,
+                    stratify=stratify,
+                )
+            else:
+                X_train_arr, X_val_arr, y_train_arr, y_val_arr = train_test_split(
+                    X,
+                    y_fit,
+                    test_size=self.validation_split_ratio,
+                    random_state=self.random_state,
+                    stratify=stratify,
+                )
 
         # 5. Load pretrained model
         self._load_pretrained(device)
@@ -767,7 +798,10 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
 
         # 8. Initial-eval safety net (rank 0 only)
         if master:
-            baseline_result = self._validate_current_model(device, X_train_arr, y_train_arr, X_val_arr, y_val_arr)
+            baseline_result = self._validate_current_model(
+                device, X_train_arr, y_train_arr, X_val_arr, y_val_arr,
+                noise_train=noise_train_arr, noise_val=noise_val_arr,
+            )
             best_metric = baseline_result.primary
             msg = f"Baseline val {self._metric_name}: {best_metric:.4f}"
             if self.verbose:
@@ -845,6 +879,7 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
                 outlier_threshold=self.outlier_threshold,
                 rank=rank,
                 world_size=world_size,
+                noise=noise_train_arr,
             )
             # Only show the nested per-batch bar when there's more than one
             # chunk in the epoch — otherwise the outer epoch bar is enough.
@@ -900,7 +935,10 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
             # 10.3  End-of-epoch validation on rank 0, broadcast primary
             #       metric to all ranks so they agree on early-stopping.
             if master:
-                eval_result = self._validate_current_model(device, X_train_arr, y_train_arr, X_val_arr, y_val_arr)
+                eval_result = self._validate_current_model(
+                    device, X_train_arr, y_train_arr, X_val_arr, y_val_arr,
+                    noise_train=noise_train_arr, noise_val=noise_val_arr,
+                )
                 primary = eval_result.primary
                 epoch_metrics = {
                     "train/epoch": epoch,

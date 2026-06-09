@@ -323,8 +323,9 @@ class FinetunedTabICLClassifier(ClassifierMixin, FinetunedTabICLBase):
         # where E = n_estimators_finetune (ensemble as the batch dim). The
         # active-feature-count tensor ``d`` is omitted: all ensemble members
         # in a fine-tuning batch share the same feature count, so ``d=None``
-        # short-circuits the mask math inside TabICL.
-        logits = model(batch.X, batch.y_train.float())
+        # short-circuits the mask math inside TabICL. ``batch.noise`` (E, T)
+        # is threaded through to the NoiseFilm adapter when present.
+        logits = model(batch.X, batch.y_train.float(), noise=batch.noise)
         # Slice down to the number of classes actually in this dataset so
         # cross-entropy targets are valid indices into the sliced logits.
         n_classes = int(batch.y_train.max().item()) + 1
@@ -339,13 +340,32 @@ class FinetunedTabICLClassifier(ClassifierMixin, FinetunedTabICLBase):
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
+        noise_train: Optional[np.ndarray] = None,
+        noise_val: Optional[np.ndarray] = None,
     ) -> ValidationMetrics:
-        """Fit ``inner`` on train, predict on val, return ROC-AUC/log-loss/accuracy."""
+        """Fit ``inner`` on train, predict on val, return ROC-AUC/log-loss/accuracy.
+
+        When the underlying model has a NoiseFilm adapter (signaled by a
+        non-None ``noise_train``), subclasses are expected to override
+        :meth:`_predict_proba_with_noise` with a noise-aware predict path —
+        the default upstream :class:`TabICLClassifier` doesn't accept
+        ``noise`` and would silently ignore it.
+        """
         # The caller (:meth:`FinetunedTabICLBase._validate_current_model`) has
         # already switched the underlying module to eval mode.
         try:
-            inner.fit(X_train, y_train)
-            proba = inner.predict_proba(X_val)
+            if noise_train is not None or noise_val is not None:
+                proba, classes_ = self._predict_proba_with_noise(
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_val=X_val,
+                    noise_train=noise_train,
+                    noise_val=noise_val,
+                )
+            else:
+                inner.fit(X_train, y_train)
+                proba = inner.predict_proba(X_val)
+                classes_ = classes_
         except (ValueError, RuntimeError) as e:
             if self.verbose:
                 import logging
@@ -363,9 +383,9 @@ class FinetunedTabICLClassifier(ClassifierMixin, FinetunedTabICLBase):
         except ValueError:
             roc = float("nan")
 
-        ll = float(log_loss(y_val, proba, labels=inner.classes_))
+        ll = float(log_loss(y_val, proba, labels=classes_))
         secondary["log_loss"] = ll
-        acc = float(accuracy_score(y_val, np.asarray(inner.classes_)[proba.argmax(axis=1)]))
+        acc = float(accuracy_score(y_val, np.asarray(classes_)[proba.argmax(axis=1)]))
         secondary["accuracy"] = acc
 
         if self.eval_metric == "roc_auc":
