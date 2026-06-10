@@ -145,6 +145,33 @@ class AdaptiveFinetunedTabICLClassifier(FinetunedTabICLClassifier):
             frozen.append(model.noise_film)
         return frozen
 
+    def _set_training_mode(self, training: bool) -> None:
+        """Set training mode without putting frozen backbone subs into eval().
+
+        The base ``_set_training_mode`` flips frozen sub-modules to ``eval()``
+        for cleanliness (no dropout / BN updates on frozen weights). That is
+        fine when *some* of the backbone is being trained, because gradients
+        still flow through whatever sub-modules are in train mode.
+
+        Here we add a trainable adapter (NAM / NoiseFilm) *between* or
+        *before* backbone sub-modules. If we flip the surrounding backbone
+        sub-modules to ``eval()``, several upstream ``col_embedder`` code
+        paths drop into ``torch.no_grad`` blocks (e.g. statistics caching
+        in ``_inference_forward``). The resulting forward graph no longer
+        connects to our adapter parameters, and ``loss.backward()`` raises
+        "element 0 of tensors does not require grad and does not have a
+        grad_fn".
+
+        We therefore leave frozen backbone sub-modules in their current
+        ``training`` setting (matching the top-level model) and rely on
+        ``requires_grad=False`` (set in ``_apply_freezing``) to enforce
+        the freeze. Dropout on frozen layers stays active but its weights
+        are not updated; this is benign for short fine-tunes and is the
+        same trade-off the earlier ``TabICLAdaptClassifier`` made for the
+        same reason.
+        """
+        self.model_.train(training)
+
     # ---- noise-aware predict path ----
 
     def _predict_proba_with_noise(

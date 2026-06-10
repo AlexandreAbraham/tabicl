@@ -441,7 +441,10 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
             )
 
         try:
-            self._fit_impl(X, y, X_val=X_val, y_val=y_val, output_dir=output_dir)
+            self._fit_impl(
+                X, y, X_val=X_val, y_val=y_val, output_dir=output_dir,
+                noise=noise, noise_val=noise_val,
+            )
         finally:
             if dist.is_initialized():
                 dist.destroy_process_group()
@@ -682,7 +685,10 @@ class FinetunedTabICLBase(BaseEstimator, ABC):
 
     # ---------------- main loop ----------------
 
-    def _fit_impl(self, X, y, *, X_val, y_val, output_dir: Optional[Path]) -> None:
+    def _fit_impl(
+        self, X, y, *, X_val, y_val, output_dir: Optional[Path],
+        noise=None, noise_val=None,
+    ) -> None:
         """Run the fine-tuning loop on already-resolved inputs.
 
         Invoked by :meth:`fit` inside a ``try/finally`` that guarantees

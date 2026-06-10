@@ -89,7 +89,11 @@ class NoiseFilm(nn.Module):
             )
 
         B, T = embeddings.shape[0], embeddings.shape[1]
-        noise = noise.to(embeddings.dtype)
+        # Keep noise in fp32 for the cond MLP. The MLP weights are fp32 and
+        # we cast its outputs back to embeddings.dtype below — this avoids
+        # AMP dtype mismatches (fp16 embeddings × fp32 cond weights would
+        # raise inside the linear matmul).
+        noise = noise.float()
 
         # Normalize to (B, T) — accept (B,) or (B, 1) as per-table broadcasts.
         if noise.dim() == 1:                               # (B,)
@@ -106,13 +110,17 @@ class NoiseFilm(nn.Module):
                 f"(B={B}, T={T})"
             )
 
-        # Compute per-row (scale, shift)
-        scale_shift = self.cond(noise.unsqueeze(-1))       # (B, T, 2*E)
+        # Compute per-row (scale, shift) in fp32 to match the cond MLP's
+        # parameters. We promote ``embeddings`` to fp32 for the FiLM ops so
+        # the autograd graph stays connected to the cond/gate parameters
+        # under AMP, and cast back at the end.
+        scale_shift = self.cond(noise.unsqueeze(-1))       # (B, T, 2*E) fp32
         scale, shift = scale_shift.chunk(2, dim=-1)        # each (B, T, E)
-        # Broadcast across the G+C feature/CLS axis.
         scale = scale.unsqueeze(2)                          # (B, T, 1, E)
         shift = shift.unsqueeze(2)                          # (B, T, 1, E)
 
-        modulated = embeddings * (1.0 + scale) + shift
-        # Gate between identity and the modulated path.
-        return embeddings + self.gate * (modulated - embeddings)
+        in_dtype = embeddings.dtype
+        emb_f = embeddings.float()
+        modulated = emb_f * (1.0 + scale) + shift
+        out = emb_f + self.gate * (modulated - emb_f)
+        return out.to(in_dtype)
